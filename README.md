@@ -75,6 +75,7 @@ appstorectl export    <bundle-id> [-o <path>]
 appstorectl resolve   <bundle-id>
 appstorectl uninstall <bundle-id>
 appstorectl jobs
+appstorectl version
 
 appstorectl accounts
 appstorectl login     <apple-id> [--password-file <path>] [--show-password] [--no-bootstrap]

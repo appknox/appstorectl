@@ -8,6 +8,8 @@ include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = appstorectl authpref
 
+APPSTORECTL_VERSION = 1.0.0
+
 # The service gate is a single entitlement: com.apple.itunesstored.private. Without it every call
 # into appstored returns ASDErrorDomain 505 "Not entitled for this service."
 appstorectl_FILES = appstorectl.m log.m export.m biometric.m account.m login.m logout.m authkit.m
@@ -17,7 +19,8 @@ appstorectl_FILES = appstorectl.m log.m export.m biometric.m account.m login.m l
 # the failure lands at runtime inside the logging path, which is the worst place to put a new bug.
 # Promoting just this family costs nothing and cannot break on an unrelated warning.
 appstorectl_CFLAGS = -fobjc-arc -Wno-deprecated-declarations \
-                     -Werror=format -Werror=format-insufficient-args -Werror=format-extra-args
+                     -Werror=format -Werror=format-insufficient-args -Werror=format-extra-args \
+                     -DAPPSTORECTL_VERSION=\"$(APPSTORECTL_VERSION)\"
 appstorectl_FRAMEWORKS = Foundation
 appstorectl_CODESIGN_FLAGS = -Sentitlements.plist
 appstorectl_INSTALL_PATH = /usr/bin

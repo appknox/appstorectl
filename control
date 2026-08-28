@@ -3,7 +3,7 @@ Name: appstorectl
 Version: 1.0.0
 Architecture: iphoneos-arm64
 Description: Install and export free App Store apps from the shell on jailbroken iOS.
-Maintainer: vinay
-Author: vinay
+Maintainer: Vinay Kumar Rasala (Xplo8E)
+Author: Vinay Kumar Rasala (Xplo8E)
 Section: Utilities
 Depends: ellekit, com.autopear.installipa, zip

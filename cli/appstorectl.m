@@ -5,6 +5,7 @@
 //   appstorectl resolve   <bundle-id>
 //   appstorectl uninstall <bundle-id>
 //   appstorectl jobs
+//   appstorectl version
 //
 // Purchase and install live here; reconstructing an IPA from an installed app lives in export.m,
 // and appstorectl.h is the seam between them.
@@ -34,6 +35,10 @@
 #import "log.h"
 #import "biometric.h"
 #import "export.h"
+
+#ifndef APPSTORECTL_VERSION
+#error APPSTORECTL_VERSION must be supplied by the build system
+#endif
 
 #pragma mark - Small helpers
 
@@ -473,6 +478,13 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
             warnf(@"could not arm AutoConfirmSheet at %@", kAutoConfirmFlag);
             return 3;
         }
+        // /var/jb/tmp is sticky. PassbookUIService runs as mobile, so it can consume the one-shot
+        // flag only when mobile owns the file created here by root.
+        if (chown(kAutoConfirmFlag.fileSystemRepresentation, 501, (gid_t)-1) != 0) {
+            warnf(@"could not transfer AutoConfirmSheet flag to mobile: %s", strerror(errno));
+            [files removeItemAtPath:kAutoConfirmFlag error:NULL];
+            return 3;
+        }
         note(@"[+] force-dismiss armed (AutoConfirmSheet tweak will dismiss the sheet)");
     }
     void (^disarm)(void) = ^{
@@ -746,7 +758,8 @@ static void usage(void) {
         "  appstorectl export    <bundle-id> [-o <path>]\n"
         "  appstorectl resolve   <bundle-id>\n"
         "  appstorectl uninstall <bundle-id>\n"
-        "  appstorectl jobs\n\n"
+        "  appstorectl jobs\n"
+        "  appstorectl version\n\n"
         "  appstorectl accounts\n"
         "  appstorectl login    <apple-id> [--password-file <path>] [--show-password] [--no-bootstrap]\n"
         "  appstorectl logout   <apple-id> [--force]\n\n"
@@ -782,6 +795,10 @@ int main(int argc, char **argv) {
         logBeginSession(argc, argv);
 
         if (argc < 2) { usage(); return logEndSession(64); }
+        if (!strcmp(argv[1], "version")) {
+            printf("appstorectl %s\n", APPSTORECTL_VERSION);
+            return logEndSession(0);
+        }
         if (!dlopen("/System/Library/PrivateFrameworks/AppStoreDaemon.framework/AppStoreDaemon",
                     RTLD_NOW)) {
             fprintf(stderr, "dlopen AppStoreDaemon failed: %s\n", dlerror());
