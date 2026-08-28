@@ -54,12 +54,34 @@ Both button actions carry a **complete** `buyParams` string, including the
 purchase completes. `cmdInstall` now loops on this rather than retrying once, because the store asks
 twice and a single retry left the second question unanswered.
 
-**The account preference is not written by this.** `authpref` still reads `unset (0)` after a
-successful install, checked immediately afterwards. The dialog is answered for that purchase only,
-which is why this works on an account where `authpref free never` itself cannot run.
+**It does write the account preference, but not visibly at first.** An earlier version of this
+document claimed the opposite, on the strength of `authpref` still reporting `unset (0)` immediately
+after a successful install. That reading was stale.
+
+`asn=2` is "Require After 15 Minutes", and the store persists it. Measured across a session on
+`2026-08-27`: the setting read `unset (0)` for hours and several installs, then settled to
+`sometimes (2)`. The local view lags the server write, because itunesstored holds a cached
+`SSAccount` and only drops it on a Darwin notification. Do not read `authpref` straight after a
+purchase and conclude anything from it.
+
+The observable consequence is the round count:
+
+| `freeDownloadsPasswordSetting` | rounds a purchase needs |
+|---|---|
+| `unset (0)` | 2 (ConfirmPaymentSheet, then ASN) |
+| `sometimes (2)` | 1 (ConfirmPaymentSheet only) |
+
+So gate 1 is **self-clearing**: the first successful purchase answers the ASN question and the
+account settles at `sometimes (2)`, after which the dialog never returns. It never reaches
+`never (3)` this way, which is what `authpref free never` would have set, but the difference no
+longer costs a round trip.
+
+None of this changes the headline: an account sitting at `unset (0)`, on which `authpref free never`
+cannot run at all, still installs fine.
 
 Observed end to end on `com.netflix.Speedtest` (2 MB, chosen so the purchase dominates the log),
-`2026-08-27`, account still at `unset (0)` before and after:
+`2026-08-27`, with the account reading `unset (0)` at the time (see the caveat above about that
+reading lagging):
 
 ```console
 $ appstorectl install com.netflix.Speedtest --force-dismiss --export
@@ -77,14 +99,13 @@ $ appstorectl install com.netflix.Speedtest --force-dismiss --export
 Three attempts, two replays. A fresh `purchaseID` per attempt is required, otherwise the store
 dedupes the retry onto the first one.
 
-The `[dialog] replied nil` line is the repaired result-handler being invoked. That call site is
-exactly where `--accept` used to die (`KERN_INVALID_ADDRESS at 0x1`), so this trace doubles as the
-regression check for it.
+The `[dialog] replied nil` line confirms that the result handler ran without the former
+`KERN_INVALID_ADDRESS at 0x1` failure.
 
-That last point matters, because on this account it *cannot* run:
+On this account, `authpref` cannot run:
 `UpdateAccountPasswordSettingsOperation` requires a secure token the account does not hold, and the
-account is stuck at `SSServerErrorDomain -5000` (no two-factor store trust for this device). Full
-reverse in [storefront-research/docs/19](../../storefront-research/docs/19-update-password-settings.md).
+account is stuck at `SSServerErrorDomain -5000` (no two-factor store trust for this device). The
+meaning of `-5000` is documented in [AUTH-INTERNALS.md](AUTH-INTERNALS.md).
 So the practical rule is:
 
 - `authpref free never` is an **optimisation**: it removes one round trip per install.
@@ -106,8 +127,8 @@ not specifically Touch ID; a Face ID device uses the same headers and selectors.
 > `BiometricState` and `BiometricStateEnabled`, read by different accessors. Live on 16.7.12:
 > writing `BiometricState = 0` alone leaves `-isBiometricStateEnabled` returning **YES**; it only
 > flips to NO once `BiometricStateEnabled` is also `0`. `-[ISBiometricStore setBiometricState:]`,
-> the only public setter, writes just the first — so clearing it alone leaves the biometric branch
-> armed. Full writeup in the research archive, `docs/11-auth-expiry.md`.
+> the only public setter, writes just the first, so clearing it alone leaves the biometric branch
+> armed.
 >
 > Related: `+[ISBiometricStore shouldUseAutoEnrollment]` is URL-bag driven and was **YES** on
 > 16.7.12, so the server can silently re-opt an account into biometric auth on sign-in. A device

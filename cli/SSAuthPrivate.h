@@ -102,6 +102,26 @@ typedef NS_ENUM(long long, SSAuthenticateResponseType) {
 
 @interface SSAccountStore (Auth)
 @property (readonly) NSArray<SSAccount *> *accounts;
+
+/// Store-level, NOT per account. Both read `LastAuthTime` out of `com.apple.itunesstored` and
+/// compare against a 900 s TTL:
+///
+///     key    = (tokenType == 1) ? @"LastAuthTime-%@" : @"LastAuthTime";
+///     stored = CFPreferencesCopyAppValue(key, @"com.apple.itunesstored");
+///     if (!stored) return YES;                 // never authenticated == expired
+///     return now > stored + 900.0;
+///
+/// Two things make this a poor health signal, both measured:
+///
+/// 1. Only `resetExpirationForTokenType:` writes that key, and the AMS payment-sheet path never
+///    calls it. On a device where it was never written these return YES permanently, including
+///    during purchases that succeed.
+/// 2. The prefs live in **mobile's** domain. As root the read may land in a different, empty
+///    domain and answer YES for that reason instead.
+///
+/// Report it, do not branch on it.
+- (BOOL)isExpired;
+- (BOOL)isExpiredForTokenType:(long long)tokenType;
 /// Drops the cache. The invalidation behind it arrives as a Darwin notification and is only
 /// delivered on a runloop turn, so never sleep before calling this.
 - (void)reloadAccounts;

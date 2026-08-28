@@ -168,6 +168,36 @@
 @end
 
 
+/// appstored's own view of the account, rather than a timestamp in a plist.
+///
+/// `+[SSAccountStore isExpired]` and friends only compare `LastAuthTime` in
+/// `com.apple.itunesstored` against a hardcoded 900 s (`+tokenExpirationInterval` returns exactly
+/// `900.0`), and `-isAuthenticationActive` is the same trick with a 600 s window over
+/// `setAuthenticationStartedDate:`. Neither asks anybody anything, which is why both read the same
+/// during purchases that work and purchases that are refused.
+///
+/// `-[ASDAccountStatusTask statusWithCompletion:]` does not do that. It goes over XPC:
+///     [[broker getClipServiceWithError:] synchronousRemoteObjectProxyWithErrorHandler:...]
+///     [proxy accountStatusUsingRequest:self withReplyHandler:...]
+/// so the answer comes from the daemon. Whether the daemon in turn asks Apple or answers from its
+/// own cache is NOT established, and `-hasCachedFamilyInfo` on the response suggests at least part
+/// of it is cached. Treat as better-sourced, not as ground truth.
+@interface ASDAccountStatusResponse : NSObject
+@property (readonly) id accountID;
+@property (readonly) long long accountStatus;
+@property (readonly) BOOL hasErrorStatus;
+@property (readonly) BOOL hasCachedFamilyInfo;
+- (BOOL)hasResponseFlag:(long long)flag;
+@end
+
+@interface ASDAccountStatusTask : NSObject
+/// Reply arity is undocumented. Over-declare as void* slots and screen slot 0 with the same
+/// pointer-alignment check cmdJobs uses; never let ARC near a slot that might not be an object.
+- (void)statusWithCompletion:(id)completion;
+@property (assign) BOOL lookupFamilyInfoIfNecessary;
+@end
+
+
 @interface SSAccountStore : NSObject
 + (id)defaultStore;
 @property (readonly) SSAccount *activeAccount;

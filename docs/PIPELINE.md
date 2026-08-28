@@ -4,15 +4,15 @@ Firmware: iOS 15.8.1 / 19H380 / iPhone9,3. Addresses are file offsets in the ext
 
 ## The short version
 
-The App Store app never talks to Apple's purchase servers. It builds an `SSPurchase` and hands it
-over XPC to **itunesstored**, which owns the credentials, the URL bag, the anti-abuse headers and
-the actual HTTPS request. The response carries download identifiers, per-Apple-ID FairPlay SINF
-blobs and the receipt. **appstored** then creates a Home Screen placeholder through
-**installcoordinationd**, the `.ipa` is stream-unzipped as it downloads, and **installd** stages the
-bundle, validates the signature, injects the SINF and registers with LaunchServices.
+On the verified `appstorectl` path, the client hands an `ASDPurchase` to **appstored** over XPC.
+Apple's daemons own the credentials, URL bag, anti-abuse headers, HTTPS request, download, FairPlay
+SINF, and installation. **appstored** creates a Home Screen placeholder through
+**installcoordinationd**, the archive is extracted while downloading, and **installd** stages the
+bundle, validates the signature, injects the SINF, and registers it with LaunchServices.
 
-`appstorectl` enters at the appstored step, which is where the App Store app's GET button enters
-too.
+The App Store app links the same client frameworks, which is consistent with this division of
+work, but its GET-button path was not traced. Treat that connection as inference, not a verified
+call path.
 
 ## The daemons
 

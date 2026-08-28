@@ -16,6 +16,7 @@
 #import <string.h>
 #import "account.h"
 #import "appstorectl.h"
+#import "log.h"
 #import "SSAuthPrivate.h"
 
 /// Read a line from the terminal with echo left ON, so the typist can see exactly what went in.
@@ -40,9 +41,8 @@ static NSString *readPassword(NSString *passwordFile, BOOL visible) {
         pw = [pw stringByTrimmingCharactersInSet:
                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (!pw.length) {
-            fprintf(stderr, "[-] password file %s unreadable or empty: %s\n",
-                    passwordFile.UTF8String,
-                    err ? err.localizedDescription.UTF8String : "no content");
+            warnf(@"[-] password file %@ unreadable or empty: %@", passwordFile,
+                  err ? err.localizedDescription : @"no content");
             return nil;
         }
         return pw;
@@ -58,9 +58,9 @@ static NSString *readPassword(NSString *passwordFile, BOOL visible) {
     const char *typed = getpass("Apple ID password: ");
     if (!typed || !*typed) return nil;
     if (strlen(typed) >= _PASSWORD_LEN - 1)
-        fprintf(stderr, "[-] password is %zu chars, at getpass()'s limit of %d. "
-                        "It may have been truncated; use --password-file instead.\n",
-                strlen(typed), _PASSWORD_LEN);
+        warnf(@"[-] password is %zu chars, at getpass()'s limit of %d. "
+               "It may have been truncated; use --password-file instead.",
+              strlen(typed), _PASSWORD_LEN);
     return @(typed);
 }
 
@@ -109,10 +109,15 @@ static SSMutableAuthenticationContext *buildContext(NSString *appleID, NSString 
 static int attemptStoreLogin(NSString *appleID, NSString *password, Class requestClass,
                              BOOL printFailure, NSError **outError) {
     SSMutableAuthenticationContext *ctx = buildContext(appleID, password);
-    if (!ctx) { fprintf(stderr, "[-] could not build an authentication context\n"); return kAccountLoadFailed; }
+    if (!ctx) { warnf(@"[-] could not build an authentication context"); return kAccountLoadFailed; }
 
     SSAuthenticateRequest *request = [[requestClass alloc] initWithAuthenticationContext:ctx];
-    if (!request) { fprintf(stderr, "[-] could not build an authenticate request\n"); return kAccountLoadFailed; }
+    if (!request) { warnf(@"[-] could not build an authenticate request"); return kAccountLoadFailed; }
+
+    // promptStyle is the gate that decides whether this authenticates at all; at its default of 0
+    // the request can return "succeeded" having contacted nobody. Worth recording per attempt.
+    logLine(@"store auth: user=%@ promptStyle=%lld printFailure=%d",
+            appleID, (long long)ctx.promptStyle, printFailure);
 
     __block BOOL replied = NO;
     __block SSAuthenticateResponseType type = SSAuthenticateResponseTypeFailed;
@@ -130,13 +135,20 @@ static int attemptStoreLogin(NSString *appleID, NSString *password, Class reques
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
 
     if (!replied) {
-        fprintf(stderr, "[-] timed out after 300s waiting for the store to reply\n");
+        warnf(@"[-] timed out after 300s waiting for the store to reply");
         return kAccountTimedOut;
     }
+
+    // Always recorded, even when printFailure is NO. That flag suppresses an *expected* -5000 on
+    // the terminal before a bootstrap; it should not erase it from the record.
+    logLine(@"store auth reply: type=%d (%s) error=%@ %ld",
+            (int)type, responseTypeName(type),
+            failure.domain ?: @"(none)", (long)failure.code);
+
     if (type != SSAuthenticateResponseTypeSucceeded) {
         if (outError) *outError = failure;
         if (printFailure) {
-            fprintf(stderr, "[-] login failed: %s\n", responseTypeName(type));
+            warnf(@"[-] login failed: %s", responseTypeName(type));
             printErrorChain(failure, 0);
         }
         return (type == SSAuthenticateResponseTypeRejected) ? kAccountRejected : kAccountAuthFailed;
@@ -147,10 +159,13 @@ static int attemptStoreLogin(NSString *appleID, NSString *password, Class reques
     // confirm against the store itself.
     SSAccount *account = waitForAccount(appleID, YES, 5.0);
     if (!account || !account.isAuthenticated) {
-        fprintf(stderr, "[-] login reported success but %s is %s\n", appleID.UTF8String,
-                account ? "not authenticated" : "absent from the account store");
+        warnf(@"[-] login reported success but %@ is %@", appleID,
+              account ? @"not authenticated" : @"absent from the account store");
         return kAccountUnverified;
     }
+    logLine(@"verified: %@ dsid=%@ sf=%@ auth=%d",
+            account.accountName, account.uniqueIdentifier,
+            account.storeFrontIdentifier, account.isAuthenticated);
 
     note(@"[+] signed in %@  storefront %@", account.accountName, account.storeFrontIdentifier);
     return kAccountOK;
@@ -159,23 +174,35 @@ static int attemptStoreLogin(NSString *appleID, NSString *password, Class reques
 int cmdLogin(NSString *appleID, NSString *passwordFile, BOOL showPassword, BOOL allowBootstrap) {
     if (!accountStore()) return kAccountLoadFailed;
 
+    // Apple's lookup is case-sensitive while findAccount() is not. Prefer the stored spelling;
+    // without a local record, lowercase the address to match Apple's normal account storage.
+    SSAccount *known = findAccount(appleID);
+    NSString *canonical = known.accountName.length ? known.accountName : appleID.lowercaseString;
+    if (![canonical isEqualToString:appleID]) {
+        note(@"[*] using %@ — Apple's account lookup is case-sensitive", canonical);
+        logLine(@"login: normalised %@ -> %@ (known=%d)", appleID, canonical, known != nil);
+        appleID = canonical;
+    }
+
     Class requestClass = NSClassFromString(@"SSAuthenticateRequest");
     if (!requestClass) {
-        fprintf(stderr, "[-] SSAuthenticateRequest unavailable\n");
+        warnf(@"[-] SSAuthenticateRequest unavailable");
         return kAccountLoadFailed;
     }
     // Without this the request is shipped to itunesstored instead of running in process. Read
     // rather than assumed: a stale cached code signature silently ships the old entitlement set.
-    if ([requestClass respondsToSelector:@selector(_isAuthkitEntitled)] &&
-        ![requestClass _isAuthkitEntitled])
-        fprintf(stderr, "[-] not AuthKit-entitled; the two-factor bootstrap will not work\n");
+    BOOL entitled = ![requestClass respondsToSelector:@selector(_isAuthkitEntitled)] ||
+                    [requestClass _isAuthkitEntitled];
+    logLine(@"authkit entitled=%d", entitled);
+    if (!entitled)
+        warnf(@"[-] not AuthKit-entitled; the two-factor bootstrap will not work");
 
     NSString *source = passwordFile.length ? @"file"
                      : (getenv("APPSTORECTL_PASSWORD") ? @"environment" : @"prompt");
     NSString *password = readPassword(passwordFile, showPassword);
     if (!password) {
-        fprintf(stderr, "[-] no password: pass --password-file, set $APPSTORECTL_PASSWORD, "
-                        "or run on a terminal\n");
+        warnf(@"[-] no password: pass --password-file, set $APPSTORECTL_PASSWORD, "
+               "or run on a terminal");
         return kAccountNoPassword;
     }
     // Length only, never the password. Tells a bad credential apart from a mis-read one.
@@ -184,16 +211,32 @@ int cmdLogin(NSString *appleID, NSString *passwordFile, BOOL showPassword, BOOL 
     // Nothing exposes whether this device already trusts this Apple ID; asking the store is the
     // test. So try it first and treat -5000 as "not trusted yet" rather than as an error.
     BOOL canBootstrap = allowBootstrap && isatty(STDIN_FILENO);
+    // Why the bootstrap will or will not be attempted. Both inputs matter and neither is printed,
+    // so a run that "just failed" is otherwise indistinguishable from one that declined to try.
+    logLine(@"bootstrap: allowed=%d tty=%d -> canBootstrap=%d",
+            allowBootstrap, isatty(STDIN_FILENO), canBootstrap);
 
     note(@"[*] signing in %@ ...", appleID);
     NSError *firstFailure = nil;
     int rc = attemptStoreLogin(appleID, password, requestClass, !canBootstrap, &firstFailure);
     if (rc != kAccountRejected || !canBootstrap) {
+        logLine(@"store login rc=%d, not bootstrapping", rc);
+
+        // printFailure was NO because a bootstrap looked possible: a -5000 there is expected and
+        // the bootstrap explains it better than the raw error would. But it suppressed every OTHER
+        // failure too, so an interactive login that failed for any other reason exited having
+        // printed nothing at all after "signing in ...". Report those here.
+        if (canBootstrap && rc != kAccountOK && rc != kAccountRejected) {
+            warnf(@"[-] login failed: %@ %ld",
+                  firstFailure.domain ?: @"unknown", (long)firstFailure.code);
+            printErrorChain(firstFailure, 1);
+        }
+
         // "The server rejected the credentials" reads as a wrong password and usually is not one.
         if (rc == kAccountRejected && allowBootstrap && !isatty(STDIN_FILENO))
-            fprintf(stderr, "[-] this device has no two-factor trust for %s yet, and there is no\n"
-                            "    terminal to type a verification code on. Run this once interactively.\n",
-                    appleID.UTF8String);
+            warnf(@"[-] this device has no two-factor trust for %@ yet, and there is no\n"
+                   "    terminal to type a verification code on. Run this once interactively.",
+                  appleID);
         return rc;
     }
 
@@ -205,15 +248,17 @@ int cmdLogin(NSString *appleID, NSString *passwordFile, BOOL showPassword, BOOL 
         // A wrong password, or a sign-in that was never challenged, already explain the rejection.
         // Replaying the -5000 underneath them makes one failure look like two.
         if (bootstrap != kAccountBadPassword && bootstrap != kAccountNotChallenged) {
-            fprintf(stderr, "[-] the store also rejected the credentials:\n");
+            warnf(@"[-] the store also rejected the credentials:");
             printErrorChain(firstFailure, 2);
         }
         if (bootstrap == kAccountNotChallenged)
-            fprintf(stderr, "[-] so this device still has no trust for %s, and the store will\n"
-                            "    keep refusing it.\n", appleID.UTF8String);
+            warnf(@"[-] so this device still has no trust for %@, and the store will\n"
+                   "    keep refusing it.", appleID);
+        logLine(@"login: bootstrap rc=%d, giving up", bootstrap);
         return bootstrap;
     }
 
+    logLine(@"login: bootstrap established trust, retrying store sign-in");
     note(@"[*] retrying the store sign-in ...");
     return attemptStoreLogin(appleID, password, requestClass, YES, NULL);
 }

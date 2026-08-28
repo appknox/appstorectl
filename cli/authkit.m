@@ -7,29 +7,32 @@
 #import <unistd.h>
 #import "account.h"
 #import "appstorectl.h"
+#import "log.h"
 #import "AKPrivate.h"
 
 int authkitBootstrap(NSString *appleID, NSString *password) {
+    logLine(@"bootstrap: begin user=%@ tty=%d", appleID, isatty(STDIN_FILENO));
+
     // AuthKit reads the code from stdin. With no terminal the run would block until the 300s
     // timeout and look like a hang, so refuse up front.
     if (!isatty(STDIN_FILENO)) {
-        fprintf(stderr,
-            "[-] two-factor bootstrap needs a terminal: AuthKit reads the code from stdin.\n"
-            "    Run this once interactively for %s, then unattended logins work.\n",
-            appleID.UTF8String);
+        warnf(@"[-] two-factor bootstrap needs a terminal: AuthKit reads the code from stdin.\n"
+               "    Run this once interactively for %@, then unattended logins work.", appleID);
         return kAccountNeedsTerminal;
     }
 
     if (!dlopen("/System/Library/PrivateFrameworks/AuthKit.framework/AuthKit", RTLD_NOW)) {
-        fprintf(stderr, "[-] dlopen AuthKit failed: %s\n", dlerror());
+        warnf(@"[-] dlopen AuthKit failed: %s", dlerror());
         return kAccountLoadFailed;
     }
     Class contextClass    = NSClassFromString(@"AKAppleIDAuthenticationCommandLineContext");
     Class controllerClass = NSClassFromString(@"AKAppleIDAuthenticationController");
     if (!contextClass || !controllerClass) {
-        fprintf(stderr, "[-] AuthKit command-line classes unavailable\n");
+        warnf(@"[-] AuthKit command-line classes unavailable (context=%d controller=%d)",
+              contextClass != nil, controllerClass != nil);
         return kAccountLoadFailed;
     }
+    logLine(@"bootstrap: AuthKit loaded, command-line classes present");
 
     AKAppleIDAuthenticationCommandLineContext *ctx = [[contextClass alloc] init];
     [ctx setUsername:appleID];
@@ -64,25 +67,33 @@ int authkitBootstrap(NSString *appleID, NSString *password) {
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
 
     if (!replied) {
-        fprintf(stderr, "[-] timed out after 300s waiting for the two-factor flow\n");
+        warnf(@"[-] timed out after 300s waiting for the two-factor flow");
         return kAccountTimedOut;
     }
+
+    // succeeded/challenged is the pair that decides everything downstream, and `challenged` in
+    // particular (kAKDidShowServerUI) is the only signal that store trust was actually established.
+    logLine(@"bootstrap: reply succeeded=%d challenged=%d dsid=%@ error=%@ %ld",
+            succeeded, challenged, dsid ?: @"(none)",
+            failure.domain ?: @"(none)", (long)failure.code);
+
     if (!succeeded) {
-        fprintf(stderr, "[-] two-factor sign-in failed\n");
+        warnf(@"[-] two-factor sign-in failed");
         printErrorChain(failure, 0);
         // -7006 is AuthKit's wrong-password error. Classified only so the caller can suppress the
         // store's redundant -5000; it never changes what is printed.
         BOOL badPassword = [failure.domain isEqualToString:@"AKAuthenticationError"] &&
                            failure.code == -7006;
+        logLine(@"bootstrap: classified as %@", badPassword ? @"bad password" : @"auth failure");
         return badPassword ? kAccountBadPassword : kAccountAuthFailed;
     }
 
     // AuthKit answers from cached device identity for an Apple ID the device already knows: real
     // credentials, no challenge, no store trust. Calling that success loops the caller forever.
     if (!challenged) {
-        fprintf(stderr, "[-] AuthKit signed in (DSID %s) but was NOT challenged for a code.\n"
-                        "    That answers from identity this device already had, and establishes\n"
-                        "    no store trust.\n", dsid.UTF8String ?: "?");
+        warnf(@"[-] AuthKit signed in (DSID %@) but was NOT challenged for a code.\n"
+               "    That answers from identity this device already had, and establishes\n"
+               "    no store trust.", dsid ?: @"?");
         return kAccountNotChallenged;
     }
 

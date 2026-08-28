@@ -133,21 +133,22 @@ build — rather than a last-compatible one.
 
 Check `minOS` with `resolve` first.
 
-## The store .ipa never exists as a file
+## No complete IPA was found on disk
 
-`IXPromisedStreamingZipTransfer` extracts the archive **while it downloads**. Confirmed empirically:
-`/var/mobile/Media/Downloads/` holds only `downloads.28.sqlitedb`, the queue database, with zero
-payload at any point during or after an install.
+`IXPromisedStreamingZipTransfer` extracts the archive while it downloads. In the observed installs,
+`/var/mobile/Media/Downloads/` held only `downloads.28.sqlitedb`, the queue database, with no
+complete payload found during or after installation. Whole-system filesystem tracing was not run.
 
-So there is no "grab the downloaded ipa" moment. `export` reconstructs the package from the
-installed container instead. The result is a genuine FairPlay-encrypted archive (`cryptid 1`,
-verified on the main binary and on all five of Opera's app extensions), but it is not byte-identical
-to Apple's: zip ordering differs, the `.sinf` is this Apple ID's, and the store already thinned the
+There was therefore no persisted IPA available to copy in the observed path. `export` reconstructs
+the package from the installed container instead. By default it decrypts the staged images; with
+`--no-decrypt`, the result keeps the genuine FairPlay-encrypted payload (`cryptid 1`, verified on
+the main binary and all five of Opera's app extensions). Neither output is byte-identical to
+Apple's: zip ordering differs, the `.sinf` is this Apple ID's, and the store already thinned the
 slice server-side (`variantID = 1:iPhone10,3:16`).
 
 Timestamps prove where the sinf comes from. On a FAST install, `SC_Info/FAST.sinf` carries the
 install time while `.supp`, `.supf`, `.supx` and `Manifest.plist` all carry the archive's own date
-from 2022. installd writes the sinf per Apple ID at install time; the rest ships in the ipa.
+from 2022. installd writes the sinf per Apple ID at install time; the rest ships in the IPA.
 
 ## SinfPaths is not the list you want
 

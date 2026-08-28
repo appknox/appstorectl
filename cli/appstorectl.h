@@ -2,12 +2,7 @@
 // appstorectl.m stays static — this is the seam, not a general-purpose utility header.
 #import <Foundation/Foundation.h>
 
-#pragma mark - Output
-
-// Set by -q. note() honours it; errors go to stderr regardless.
-extern BOOL gQuiet;
-
-void note(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+#import "log.h"
 
 NSString *humanBytes(long long bytes);
 

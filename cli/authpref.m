@@ -54,14 +54,8 @@ int main(int argc, char **argv) {
         else        acct.paidPurchasesPasswordSetting = v;
         printf("\n[+] setting %s -> %s, pushing to the account...\n", argv[1], argv[2]);
 
-        // The reply block's arity is not in any header and guessing wrong is a crash, not an
-        // error: ARC will retain whatever sits in an argument slot it thinks is an object. Take
-        // raw pointers, validate, and never let ARC touch them.
-        // Take NO arguments. The real block's arity is undocumented, and probing the argument
-        // slots is unsafe by construction: a bogus pointer raises SIGSEGV, which @try does not
-        // catch (it catches ObjC exceptions, not signals). That is what crashed this tool twice.
-        // A zero-argument block is always safe to invoke — extra registers are simply ignored —
-        // so we just learn that the reply arrived, then confirm the outcome by re-reading.
+        // The reply block's arity is undocumented, and probing unknown argument slots can fault.
+        // Ignore the arguments and verify the result by re-reading the account store.
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [acct updateAccountPasswordSettingsWithRequestProperties:nil completionBlock:^{
             dispatch_semaphore_signal(sem);

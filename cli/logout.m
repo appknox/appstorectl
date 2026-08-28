@@ -13,30 +13,39 @@
 
 #import "account.h"
 #import "appstorectl.h"
+#import "log.h"
 #import "SSAuthPrivate.h"
 
 int cmdLogout(NSString *appleID, BOOL force) {
+    logLine(@"logout: begin target=%@ force=%d", appleID, force);
+
     id store = accountStore();
     if (!store) return kAccountLoadFailed;
 
     SSAccount *account = findAccount(appleID);
     if (!account) {
-        fprintf(stderr, "[-] no account matches %s\n", appleID.UTF8String);
+        warnf(@"[-] no account matches %@", appleID);
         return kAccountNotFound;
     }
+    // findAccount matches case-insensitively while Apple's own lookup does not, so record what was
+    // asked for next to what was found. They are not always the same string.
+    logLine(@"logout: matched %@ dsid=%@ active=%d local=%d",
+            account.accountName, account.uniqueIdentifier,
+            account.isActive, account.isLocalAccount);
 
     // The local pseudo-account is device state, not a sign-in. Removing it is never what anyone
     // means, so this is not overridable.
     if (account.isLocalAccount) {
-        fprintf(stderr, "[-] %s is the local pseudo-account, not a signed-in Apple ID\n",
-                appleID.UTF8String);
+        warnf(@"[-] %@ is the local pseudo-account, not a signed-in Apple ID", appleID);
         return kAccountRefused;
     }
     if (account.isActive && !force) {
-        fprintf(stderr, "[-] %s is the active account, the one this device buys with.\n"
-                        "    Pass --force if that is really what you want.\n", appleID.UTF8String);
+        warnf(@"[-] %@ is the active account, the one this device buys with.\n"
+               "    Pass --force if that is really what you want.", appleID);
         return kAccountRefused;
     }
+    if (account.isActive)
+        logLine(@"logout: removing the ACTIVE account, --force given");
 
     note(@"[*] removing %@ ...", account.accountName);
 
@@ -53,14 +62,19 @@ int cmdLogout(NSString *appleID, BOOL force) {
         [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
 
     if (!replied) {
-        fprintf(stderr, "[-] timed out after 30s waiting for the removal to complete\n");
+        warnf(@"[-] timed out after 30s waiting for the removal to complete");
         return kAccountTimedOut;
     }
+
+    logLine(@"logout: removeAccount replied ok=%d error=%@ %ld",
+            removed, failure.domain ?: @"(none)", (long)failure.code);
+
     if (!removed) {
-        fprintf(stderr, "[-] removal failed: %s %ld\n",
-                failure.domain.UTF8String ?: "unknown", (long)failure.code);
+        // code 7 here is ACErrorPermissionDenied, i.e. the allaccounts entitlement did not apply.
+        warnf(@"[-] removal failed: %@ %ld", failure.domain ?: @"unknown", (long)failure.code);
         if (failure.localizedDescription.length)
-            fprintf(stderr, "  %s\n", failure.localizedDescription.UTF8String);
+            warnf(@"  %@", failure.localizedDescription);
+        printErrorChain(failure, 1);
         return kAccountRemoveFailed;
     }
 
@@ -68,9 +82,10 @@ int cmdLogout(NSString *appleID, BOOL force) {
     // read taken right now still sees the cached account. waitForAccount spins the runloop, which
     // is what delivers it.
     if (waitForAccount(appleID, NO, 5.0)) {
-        fprintf(stderr, "[-] removal reported success but %s is still present\n", appleID.UTF8String);
+        warnf(@"[-] removal reported success but %@ is still present", appleID);
         return kAccountUnverified;
     }
+    logLine(@"logout: verified absent from the account store");
 
     note(@"[+] removed %@", appleID);
     return kAccountOK;

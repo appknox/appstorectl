@@ -4,9 +4,14 @@ THEOS_PACKAGE_SCHEME = rootless
 
 include $(THEOS)/makefiles/common.mk
 
-# Both halves ship in one package: the tweak is inert unless the CLI arms it, so installing
+# All three ship in one package: the tweak is inert unless the CLI arms it, so installing
 # either alone is a confusing half-state.
-SUBPROJECTS = cli tweak
+#
+# decrypt/ is a separate binary rather than more files in cli/ because it needs entitlements
+# the CLI must not carry: task_for_pid-allow, com.apple.private.cs.debugger and no-sandbox.
+# Merging them would hand the store client debugger rights it has no use for, to save one
+# posix_spawn. See decrypt/entitlements.plist.
+SUBPROJECTS = cli tweak decrypt
 
 include $(THEOS_MAKE_PATH)/aggregate.mk
 

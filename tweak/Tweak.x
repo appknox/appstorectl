@@ -1,33 +1,7 @@
-// AutoConfirmSheet — dismiss the App Store purchase-confirmation sheet, and only that.
-//
-// Why this exists
-// ---------------
-// appstored's purchase flow ends in a MZCommerce.ConfirmPaymentSheet confirmation. It is drawn by
-// PassbookUIService as a PassKit payment-authorization remote alert, NOT routed through appstored's
-// dialog delegate, so no client API can answer it (notifyDialogCompleteForPurchaseID: is accepted
-// by the daemon but is a no-op for this sheet). Without a tap, `appstorectl install` times out.
-//
-// The sheet does not need to be *confirmed*, only *dismissed*: the resulting rejection carries a
-// confirmedPaymentUUID, and appstorectl replays that to complete the purchase silently.
-//
-// Safety posture
-// --------------
-// This tweak never authorizes anything. It only dismisses, which is the same outcome as the user
-// tapping outside the sheet. Three independent conditions must all hold:
-//
-//   1. the process is PassbookUIService
-//   2. the controller is PKPaymentAuthorizationRemoteAlertViewController
-//   3. /var/jb/tmp/.autoconfirm exists — created by `appstorectl --force-dismiss` for the few
-//      seconds its own purchase is in flight, and removed on every exit path
-//
-// So a real Apple Pay sheet, opened at any other time, is untouched. Even inside the window the
-// worst case is a cancelled sheet, never an approved payment.
-//
-// Discovery notes (how the target was identified)
-// -----------------------------------------------
-//   present VC in PassbookUIService:
-//     PKPaymentAuthorizationServiceCompactNavigationContainerController
-//     (from PKPaymentAuthorizationRemoteAlertViewController)
+// Dismiss the App Store purchase-confirmation sheet in PassbookUIService. Dismissal returns a
+// confirmedPaymentUUID that appstorectl replays; this tweak never confirms or authorizes payment.
+// It acts only on PKPaymentAuthorizationRemoteAlertViewController while a fresh one-shot
+// /var/jb/tmp/.autoconfirm flag exists. The CLI cleans the flag after a normal purchase call.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -51,6 +25,7 @@ static NSString *const kEnableFlagPath = @"/var/jb/tmp/.autoconfirm";
 // NSLog goes to the unified log, which cannot be streamed on this device (iOS ships no
 // /usr/bin/log). Append to a file so every decision is inspectable over SSH.
 static NSString *const kTracePath = @"/var/jb/tmp/autoconfirm.log";
+static const NSTimeInterval kArmLifetime = 5 * 60;
 
 static void trace(NSString *format, ...) {
     va_list args;
@@ -69,8 +44,25 @@ static void trace(NSString *format, ...) {
     [handle closeFile];
 }
 
-static BOOL armed(void) {
-    return [NSFileManager.defaultManager fileExistsAtPath:kEnableFlagPath];
+static BOOL consumeArm(void) {
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSDictionary *attributes = [files attributesOfItemAtPath:kEnableFlagPath error:NULL];
+    if (!attributes) return NO;
+
+    NSDate *modified = attributes[NSFileModificationDate];
+    NSTimeInterval age = -modified.timeIntervalSinceNow;
+    if (!modified || age < 0 || age > kArmLifetime) {
+        [files removeItemAtPath:kEnableFlagPath error:NULL];
+        trace(@"ignoring expired force-dismiss flag");
+        return NO;
+    }
+
+    NSError *error = nil;
+    if (![files removeItemAtPath:kEnableFlagPath error:&error]) {
+        trace(@"could not consume force-dismiss flag: %@", error);
+        return NO;
+    }
+    return YES;
 }
 
 // Close the sheet using whichever API this iOS version actually has. Ordered newest-known first;
@@ -136,7 +128,7 @@ static void dismissSheet(PKPaymentAuthorizationRemoteAlertViewController *vc) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
 
-    if (!armed()) {
+    if (!consumeArm()) {
         trace(@"payment sheet appeared but not armed — leaving it alone");
         return;
     }

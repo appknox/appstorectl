@@ -2,7 +2,7 @@ Package: com.appknox.appstorectl
 Name: appstorectl
 Version: 1.0.0
 Architecture: iphoneos-arm64
-Description: Buy and install App Store apps from the shell. Hands an ASDPurchase to appstored over XPC and lets Apple's own pipeline do the purchase, download, FairPlay binding and install. Ships with AutoConfirmSheet, a tweak that dismisses only the App Store purchase-confirmation sheet so installs need no interaction.
+Description: Install and export free App Store apps from the shell on jailbroken iOS.
 Maintainer: vinay
 Author: vinay
 Section: Utilities

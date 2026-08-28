@@ -12,7 +12,7 @@ I have also left in two conclusions I got wrong and later reversed, because how 
 
 ## The one idea behind it
 
-appstorectl does not implement the App Store purchase protocol. It signs nothing, handles no credentials, and never sees your password. It does make one plain HTTP request to Apple, a public metadata lookup, and I will come back to that because it is the one exception.
+The purchase/install path does not implement the App Store purchase protocol, receive credentials, or see your password. It does make one plain HTTP request to Apple, a public metadata lookup, and I will come back to that because it is the one exception. The separate `login` command does handle the password supplied through a file, `APPSTORECTL_PASSWORD`, or its terminal prompt.
 
 What it does instead is build a single object, `ASDPurchase`, and hand it to a daemon called **appstored** over XPC. XPC is Apple's inter-process communication mechanism, so this is a local call to a service already running on the phone rather than anything going out to the network. Everything after that point, the network calls, the FairPlay keybag that holds the decryption keys for purchased apps, the download, the install, is Apple's own pipeline doing what it normally does.
 
@@ -30,7 +30,7 @@ flowchart LR
 
 How much of that diagram is proven, and how much is inference, is worth being precise about. `AppStore.bin`'s load commands link `AppStoreDaemon.framework`, `AppleMediaServices.framework` and `StoreServices.framework`, the same three the CLI uses, and its only reference to `ASDPurchase` anywhere in 32,000 functions is in purchase history rather than the buy path. That establishes the App Store app is a UI layer over the same client frameworks. It does **not** prove the app constructs an `ASDPurchase` and calls `startPurchase:` the way we do. I did not trace its GET button, and the binary is almost entirely Swift.
 
-What the evidence does support, and what actually matters for the rest of this: **for this purchase path, authentication state is owned by the daemon, not by the client.** appstorectl cannot hold its own credentials, and it inherits whatever the daemon and the server decide.
+What the evidence does support, and what actually matters for the rest of this: **for this purchase path, authentication state is owned by the daemon, not supplied by the client.** The purchase inherits whatever the daemon and the server decide.
 
 ---
 
@@ -52,14 +52,14 @@ sequenceDiagram
     C->>C: biometricPreflight()
     C->>S: GET itunes.apple.com/lookup?bundleId=...
     S-->>C: adamId, price, minOS
-    C->>C: touch /var/jb/tmp/.autoconfirm
+    C->>C: create fresh /var/jb/tmp/.autoconfirm
     C->>A: getPurchaseServiceWithError:
     A-->>C: XPC proxy (hold this)
     C->>A: startPurchase: (ASDPurchase)
     A->>S: buyProduct
     S-->>A: dialog + replay params
     A->>W: sheet is presented
-    W->>W: armed? yes
+    W->>W: consume fresh flag
     W->>A: dismiss
     A-->>C: failure, carrying the replay params
     C->>A: startPurchase: (replay)
@@ -72,9 +72,9 @@ sequenceDiagram
 
 Most of that is unremarkable. Four steps are not, and each has a detail the diagram cannot show.
 
-### Resolving the bundle id
+### Resolving the bundle ID
 
-This is the one HTTP request appstorectl makes itself. It hits `https://itunes.apple.com/lookup?bundleId=...`, first with the device's country code and then bare, and reads back the **adamId** (Apple's numeric identifier for a store item), the price and the minimum OS version.
+This is the one HTTP request appstorectl makes itself. It hits `https://itunes.apple.com/lookup?bundleId=...`, first with the device's country code and then bare, and reads back `adamId` (Apple's numeric identifier for a store item), the price and the minimum OS version.
 
 It is a public endpoint, unauthenticated, read-only, and no daemon is involved. That is why I said the tool does not implement the purchase protocol rather than that it never talks to Apple. This request is still an Apple HTTP request, it just does not buy anything.
 
@@ -135,7 +135,7 @@ for (int elapsed = 0; elapsed < 600; elapsed += 2) {
 
 Two things about that loop, and I want to separate them carefully because I previously ran them together and was wrong.
 
-**The completion check is a plain filesystem read.** `installedBundlePath()` scans `/var/containers/Bundle/Application/*/iTunesMetadata.plist` for a matching bundle id, and `isFullyInstalled()` looks for an `SC_Info/*.sinf` inside the result. The SINF is the per-Apple-ID FairPlay licence blob written at install time, and its presence is the most reliable on-disk signal that an install actually finished rather than being a placeholder. Neither call depends on the runloop, so `sleep` here would still detect completion.
+**The completion check is a plain filesystem read.** `installedBundlePath()` scans `/var/containers/Bundle/Application/*/iTunesMetadata.plist` for a matching bundle ID, and `isFullyInstalled()` looks for an `SC_Info/*.sinf` inside the result. The SINF is the per-Apple-ID FairPlay licence blob written at install time, and its presence is the most reliable on-disk signal that an install actually finished rather than being a placeholder. Neither call depends on the runloop, so `sleep` here would still detect completion.
 
 **`runUntilDate:` is for the progress callbacks.** The `ASDProgress` objects that produce the percentage lines arrive through `ASDNotificationCenter`, and those are delivered on a runloop turn. Sleep instead and the install still completes and is still detected, you just get no progress output.
 
@@ -280,9 +280,9 @@ flowchart TD
     C1 -->|no| X["do nothing"]
     C1 -->|yes| C2{"controller is<br/>PKPaymentAuthorizationRemoteAlert...?"}
     C2 -->|no| X
-    C2 -->|yes| C3{"/var/jb/tmp/.autoconfirm<br/>exists?"}
+    C2 -->|yes| C3{"fresh one-shot<br/>.autoconfirm flag?"}
     C3 -->|no| X
-    C3 -->|yes| D["dismiss it"]
+    C3 -->|yes| D["consume flag and dismiss"]
     D --> U["call returns with<br/>the replay params"]
     U --> R["appstorectl replays them"]
 
@@ -293,7 +293,7 @@ flowchart TD
 
 The important part is what it does not do. It only ever dismisses, which is the same outcome as tapping outside the sheet. It cannot approve a payment and it cannot synthesize an authorization.
 
-There is one honest limit to state. `--force-dismiss` creates `/var/jb/tmp/.autoconfirm` before purchasing and removes it on every exit path, so outside that window the tweak is completely inert. Inside it, the hook matches on process and controller class, not on anything tying the sheet to our specific purchase. If another matching payment sheet appeared during those few seconds, it would be dismissed too. That is a cancelled sheet rather than an approved payment, so the failure mode is annoying rather than dangerous, but it is a real race and not something the design rules out.
+There is one honest limit to state. `--force-dismiss` creates `/var/jb/tmp/.autoconfirm` before purchasing. The tweak accepts the flag for at most five minutes and consumes it when the first matching sheet appears; the CLI also removes it when the purchase call ends normally. The hook matches on process and controller class, not on anything tying the sheet to our specific purchase. If another matching payment sheet appeared during that window, it could be dismissed instead. That is a cancelled sheet rather than an approved payment, but it is a real race and not something the design rules out.
 
 The dismissal selector also moved between releases, so it is probed at runtime rather than hardcoded:
 
@@ -420,11 +420,10 @@ None of that is reachable from a client. When a purchase is refused, the useful 
 The tool's value is that it rides the real pipeline. The price is that it inherits every rule the pipeline enforces.
 
 ---
----
 
 # Appendix A: exporting the IPA
 
-This is a separate concern from everything above and can be skipped. `appstorectl export` packages an installed app back into an encrypted `.ipa`.
+This is a separate concern from everything above and can be skipped. `appstorectl export` reconstructs an IPA from an installed app and decrypts its encrypted images by default. `--no-decrypt` keeps the installed FairPlay-encrypted images unchanged.
 
 The first thing to understand is that it reconstructs rather than copies, because there is no downloaded `.ipa` to copy.
 
@@ -456,7 +455,7 @@ Putting those together: **I found no persisted complete IPA, and the install pat
 
 The container holds four things. `<App>.app/` and `iTunesMetadata.plist` go into the package, as `Payload/<App>.app/` and a sibling metadata file. `BundleMetadata.plist` and `.com.apple.mobile_container_manager.metadata.plist` stay out, because both are device-local installd bookkeeping rather than part of what the store shipped.
 
-The output is a reconstructed IPA containing the store-installed, still FairPlay-encrypted payload. `cryptid` stays `1`, which is the Mach-O header flag saying the binary's text section is still encrypted. Nothing here decrypts anything.
+By default, the staged copy is passed through `appstorectl-decrypt` before packaging. Encrypted images are replaced with their runtime plaintext and their Mach-O encryption command moves from `cryptid 1` to `cryptid 0`; the installed bundle is never modified. With `--no-decrypt`, the reconstructed IPA keeps the store-installed FairPlay-encrypted payload at `cryptid 1`.
 
 It is not byte-identical to Apple's: zip ordering differs, the SINF is this Apple ID's, some original package files like `iTunesArtwork` are absent, and the store already thinned the slice server-side. It is byte-reproducible run to run.
 
