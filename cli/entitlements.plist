@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+
+	<!-- The only entitlement that actually opens the door. appstored's service catalog gates the
+	     purchase and purchase-history services on this one; every com.apple.appstored.* entitlement
+	     returns ASDErrorDomain 505 instead. Verified by bisecting one entitlement at a time. -->
+	<key>com.apple.itunesstored.private</key>
+	<true/>
+</dict>
+</plist>
