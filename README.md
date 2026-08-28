@@ -165,7 +165,7 @@ AutoConfirmSheet writes its decisions to `/var/jb/tmp/autoconfirm.log`.
 - [Account commands](docs/ACCOUNTS.md)
 - [Authentication internals](docs/AUTH-INTERNALS.md)
 - [Implementation findings](docs/FINDINGS.md)
-- [Development notes](DEVELOPING.md)
+- [Development notes](docs/DEVELOPING.md)
 
 ## License
 
