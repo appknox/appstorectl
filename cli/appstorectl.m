@@ -1,9 +1,13 @@
 // appstorectl — buy and install an App Store app from the shell, by bundle id.
 //
-//   appstorectl install   <bundle-id> [--adam <id>] [--accept]
+//   appstorectl install   <bundle-id> [--adam <id>] [--accept] [--export [-o <path>]]
+//   appstorectl export    <bundle-id> [-o <path>]
 //   appstorectl resolve   <bundle-id>
 //   appstorectl uninstall <bundle-id>
 //   appstorectl jobs
+//
+// Purchase and install live here; packaging an installed app back into an encrypted .ipa lives in
+// export.m, and appstorectl.h is the seam between them.
 //
 // It does not reimplement the store protocol. It hands an ASDPurchase to appstored over XPC and
 // lets Apple's own pipeline do the buying, downloading, FairPlay binding and installing — the same
@@ -23,12 +27,16 @@
 #import <sys/wait.h>
 
 #import "ASDPrivate.h"
+#import "appstorectl.h"
+#import "biometric.h"
+#import "export.h"
 
 #pragma mark - Small helpers
 
-static BOOL gQuiet = NO;
+// gQuiet, note() and humanBytes() are declared in appstorectl.h — export.m shares them.
+BOOL gQuiet = NO;
 
-static void note(NSString *fmt, ...) {
+void note(NSString *fmt, ...) {
     if (gQuiet) return;
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -36,7 +44,21 @@ static void note(NSString *fmt, ...) {
     printf("%s\n", s.UTF8String);
 }
 
-static NSString *humanBytes(long long b) {
+// Dump everything the store said. AMSServerPayload carries the real reason (dialog title, body and
+// okButtonAction) and is the only place a refusal explains itself, so print the whole userInfo
+// rather than just localizedDescription, which is usually a generic string.
+static void describeError(NSError *err) {
+    if (!err) { note(@"    (no error object)"); return; }
+    note(@"    domain : %@", err.domain);
+    note(@"    code   : %ld", (long)err.code);
+    note(@"    message: %@", err.localizedDescription ?: @"-");
+    for (NSString *k in err.userInfo) {
+        if ([k isEqualToString:@"NSLocalizedDescription"]) continue;
+        note(@"    %@ = %@", k, err.userInfo[k]);
+    }
+}
+
+NSString *humanBytes(long long b) {
     if (b <= 0) return @"0 B";
     static const char *u[] = {"B", "KB", "MB", "GB"};
     double v = (double)b; int i = 0;
@@ -194,6 +216,53 @@ static NSString *confirmBuyParamsFromError(NSError *err) {
     return nil;
 }
 
+// Not every sheet is the same sheet, and dismissing only works for one of them. Observed dialogs:
+//
+//   MZCommerce.ConfirmPaymentSheet       dialog.kind = Buy            dismissal works
+//   MZCommerce.ConfirmPaymentSheet.Auth  dialog.kind = authorization  dismissal is useless
+//   MZCommerce.TID.SignatureRequired     biometric signature          dismissal is useless
+//
+// The Buy sheet is pure confirmation, so a rejection still carries a usable confirmedPaymentUUID.
+// The other two demand something a dismissal cannot produce — a password or a TID signature — and
+// the buyParams they hand back are rejected on replay. Telling them apart is the difference between
+// "retry once more" and "a human has to touch this device".
+static NSString *storeDialogKind(NSError *err) {
+    id payload = err.userInfo[@"AMSServerPayload"];
+    if ([payload isKindOfClass:NSDictionary.class]) {
+        id kind = [[payload objectForKey:@"dialog"] objectForKey:@"kind"];
+        if ([kind isKindOfClass:NSString.class] && [kind length]) return kind;
+    }
+
+    // iOS 15.x renders the payload as a description string instead of a dictionary.
+    for (NSString *key in err.userInfo) {
+        if (![key hasPrefix:@"AMSServerPayload"]) continue;
+        id value = err.userInfo[key];
+        NSString *desc = [value isKindOfClass:NSString.class] ? value : [value description];
+        NSRange at = [desc rangeOfString:@"kind = "];
+        if (at.location == NSNotFound) continue;
+        NSUInteger start = at.location + at.length;
+        NSRange end = [desc rangeOfString:@";" options:0
+                                    range:NSMakeRange(start, desc.length - start)];
+        if (end.location == NSNotFound) continue;
+        NSString *kind = [[desc substringWithRange:NSMakeRange(start, end.location - start)]
+                          stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (kind.length) return kind;
+    }
+    return nil;
+}
+
+static void explainDialogKind(NSString *kind) {
+    if (!kind.length) return;
+    if ([kind caseInsensitiveCompare:@"authorization"] == NSOrderedSame) {
+        note(@"[-] the store wants the Apple ID password — the sign-in session has expired.");
+        note(@"    authpref governs the per-purchase password prompt, not the account session,");
+        note(@"    so it cannot suppress this. Sign in once on the device (App Store app, or");
+        note(@"    Settings -> App Store), then re-run.");
+        return;
+    }
+    note(@"[-] store dialog kind '%@' cannot be answered by dismissing it", kind);
+}
+
 // Answer a pending confirmation sheet for this purchase. selectedButton 0 is the default
 // ("ok" / Get in the ConfirmPaymentSheet); 1 is Cancel.
 // Answer a pending confirmation sheet. Must be sent on the SAME service proxy that carried
@@ -245,24 +314,34 @@ static NSString *installedVersionDescription(NSString *bundleID) {
     return nil;
 }
 
-static NSString *installedBundlePath(NSString *bundleID) {
+// The container, not the .app: iTunesMetadata.plist is a sibling of the bundle, and export needs
+// both. installedBundlePath() derives the .app from this.
+NSString *installedContainerPath(NSString *bundleID) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *root = @"/var/containers/Bundle/Application";
     for (NSString *uuid in [fm contentsOfDirectoryAtPath:root error:NULL]) {
         NSString *container = [root stringByAppendingPathComponent:uuid];
         NSString *meta = [container stringByAppendingPathComponent:@"iTunesMetadata.plist"];
         NSDictionary *md = [NSDictionary dictionaryWithContentsOfFile:meta];
-        if (![md[@"softwareVersionBundleId"] isEqualToString:bundleID]) continue;
-
-        for (NSString *entry in [fm contentsOfDirectoryAtPath:container error:NULL]) {
-            if (![entry hasSuffix:@".app"]) continue;
-            return [container stringByAppendingPathComponent:entry];
-        }
+        if ([md[@"softwareVersionBundleId"] isEqualToString:bundleID]) return container;
     }
     return nil;
 }
 
-static BOOL isFullyInstalled(NSString *appPath) {
+NSString *bundleInContainer(NSString *container) {
+    if (!container) return nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *entry in [fm contentsOfDirectoryAtPath:container error:NULL]) {
+        if ([entry hasSuffix:@".app"]) return [container stringByAppendingPathComponent:entry];
+    }
+    return nil;
+}
+
+static NSString *installedBundlePath(NSString *bundleID) {
+    return bundleInContainer(installedContainerPath(bundleID));
+}
+
+BOOL isFullyInstalled(NSString *appPath) {
     if (!appPath) return NO;
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *scInfo = [appPath stringByAppendingPathComponent:@"SC_Info"];
@@ -332,6 +411,10 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
 
     __block BOOL ok = NO;
     __block NSString *retryParams = nil;
+    // Kept so a rejected retry can report what the store actually said. Without it the only clue
+    // is our own summary line, and a retry that fails *with* a dialog payload prints nothing at
+    // all — which is precisely the case worth diagnosing.
+    __block NSError *lastError = nil;
 
     // One purchase attempt. Returns via the two __block vars above.
     BOOL (^attempt)(NSString *) = ^BOOL(NSString *params) {
@@ -380,18 +463,11 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
                 ok = r.success;
                 if (!r.success) {
                     NSError *err = r.error ?: e;
+                    lastError   = err;
                     retryParams = confirmBuyParamsFromError(err);
                     if (!retryParams) {
                         note(@"[-] purchase failed");
-                        if (err) {
-                            note(@"    domain : %@", err.domain);
-                            note(@"    code   : %ld", (long)err.code);
-                            note(@"    message: %@", err.localizedDescription ?: @"-");
-                            for (NSString *k in err.userInfo) {
-                                if ([k isEqualToString:@"NSLocalizedDescription"]) continue;
-                                note(@"    %@ = %@", k, err.userInfo[k]);
-                            }
-                        }
+                        describeError(err);
                     }
                 }
                 dispatch_semaphore_signal(sem);
@@ -410,7 +486,11 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
     if (!ok && retryParams) {
         note(@"[+] store returned a confirmation with confirmedPaymentUUID; resending");
         if (!attempt(retryParams)) { note(@"[-] retry timed out"); disarm(); return 4; }
-        if (!ok) note(@"[-] retry rejected — the UUID is probably single-use or cancel-invalidated");
+        if (!ok) {
+            note(@"[-] retry rejected by the store");
+            describeError(lastError);
+            explainDialogKind(storeDialogKind(lastError));
+        }
     }
 
     disarm();   // the sheet is behind us either way; do not leave the tweak armed
@@ -476,10 +556,14 @@ static int cmdJobs(void) {
 static void usage(void) {
     fprintf(stderr,
         "appstorectl — buy and install App Store apps from the shell\n\n"
-        "  appstorectl install   <bundle-id> [--adam <id>] [--accept]\n"
+        "  appstorectl install   <bundle-id> [--adam <id>] [--accept] [--export [-o <path>]]\n"
+        "  appstorectl export    <bundle-id> [-o <path>]\n"
         "  appstorectl resolve   <bundle-id>\n"
         "  appstorectl uninstall <bundle-id>\n"
         "  appstorectl jobs\n\n"
+        "  --export     after installing, package the app as an encrypted .ipa\n"
+        "  --no-preflight  skip the biometric pre-flight (see docs/GATES.md gate 2)\n"
+        "  -o <path>    export destination (default /var/jb/tmp/appstorectl-exports/)\n"
         "  --adam <id>  skip store lookup and use this adamId\n"
         "  --accept       auto-answer store dialogs affirmatively\n"
         "  --force-dismiss  auto-dismiss the confirmation sheet (needs the AutoConfirmSheet tweak)\n"
@@ -512,13 +596,22 @@ int main(int argc, char **argv) {
         // payment sheets through the dialog delegate.
         BOOL autoConfirm = NO;
         BOOL forceDismiss = NO;
+        BOOL alsoExport = NO;
+        BOOL skipPreflight = NO;
+        NSString *exportPath = nil;
 
         for (int i = 2; i < argc; i++) {
             NSString *a = @(argv[i]);
             if ([a isEqualToString:@"--accept"])        { autoAccept = YES;   continue; }
             if ([a isEqualToString:@"--try-confirm"])   { autoConfirm = YES;  continue; }
             if ([a isEqualToString:@"--force-dismiss"]) { forceDismiss = YES; continue; }
+            if ([a isEqualToString:@"--export"])        { alsoExport = YES;   continue; }
+            if ([a isEqualToString:@"--no-preflight"])  { skipPreflight = YES; continue; }
             if ([a isEqualToString:@"-q"])         { gQuiet = YES;     continue; }
+            if ([a isEqualToString:@"-o"] && i + 1 < argc) {
+                exportPath = @(argv[++i]);
+                continue;
+            }
             if ([a isEqualToString:@"--adam"] && i + 1 < argc) {
                 adamOverride = @(atoll(argv[++i]));
                 continue;
@@ -526,14 +619,28 @@ int main(int argc, char **argv) {
             [pos addObject:a];
         }
 
+        // Internal, re-exec'd as mobile by biometricPreflight(). Not in usage on purpose.
+        if ([cmd isEqualToString:@"_biometric-preflight"]) return cmdBiometricPreflight();
+
         if ([cmd isEqualToString:@"jobs"]) return cmdJobs();
         if (pos.count < 1) { usage(); return 64; }
         NSString *bundleID = pos[0];
 
         if ([cmd isEqualToString:@"resolve"])   return resolveAdamID(bundleID, NULL) ? 0 : 66;
         if ([cmd isEqualToString:@"uninstall"]) return cmdUninstall(bundleID);
-        if ([cmd isEqualToString:@"install"])
-            return cmdInstall(bundleID, adamOverride, autoAccept, autoConfirm, forceDismiss);
+        if ([cmd isEqualToString:@"export"])    return cmdExport(bundleID, exportPath);
+        if ([cmd isEqualToString:@"install"]) {
+            // Before spending a purchase: if the account is opted into a biometric this device
+            // cannot perform, the store will demand a password no dismissal can answer. Clearing
+            // that is the difference between a hands-off install and a dead end.
+            if (!skipPreflight) biometricPreflight();
+
+            int rc = cmdInstall(bundleID, adamOverride, autoAccept, autoConfirm, forceDismiss);
+            // Only package what actually installed — exporting after a failed install would either
+            // error confusingly or silently archive a stale copy from an earlier run.
+            if (rc != 0 || !alsoExport) return rc;
+            return cmdExport(bundleID, exportPath);
+        }
 
         usage();
         return 64;

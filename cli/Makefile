@@ -10,7 +10,7 @@ TOOL_NAME = appstorectl authpref
 
 # The service gate is a single entitlement: com.apple.itunesstored.private. Without it every call
 # into appstored returns ASDErrorDomain 505 "Not entitled for this service."
-appstorectl_FILES = appstorectl.m
+appstorectl_FILES = appstorectl.m export.m biometric.m
 appstorectl_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 appstorectl_FRAMEWORKS = Foundation
 appstorectl_CODESIGN_FLAGS = -Sentitlements.plist

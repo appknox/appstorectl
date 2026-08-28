@@ -24,6 +24,23 @@
 
 // The purchase request handed to appstored. Four fields matter; the rest of the pipeline fills
 // itself in.
+//
+// The complete wire format is 30 keys, from -[ASDPurchase encodeWithCoder:] at 0x199fab618 in
+// AppStoreDaemon (15.8.1). Declared below is only the subset we set. The rest, for reference:
+//
+//   identity     accountIdentifier, isDSIDless, itemName, vendorName
+//   request      preflightURL, additionalHeaders
+//   intent       isUpdate, isRefresh, isBackgroundUpdate, installUniversalVariant,
+//                expectsIOSAppOnMac, forceWatchInstall, softwarePlatform, requiredCapabilities,
+//                extensionsToEnable, gratisIdentifiers
+//   behaviour    displaysOnLockScreen, sendGUID, shouldCancelForInstalledBundleItems
+//   attribution  affiliateIdentifier, referrerName, referrerURL
+//
+// Worth knowing: there is NO credential, token, sinf or receipt field anywhere in that list. A
+// client cannot supply auth material even in principle. appstored authenticates with the session
+// it already holds, which is the same one the App Store app uses. That is why no client-side
+// change can answer an authorization demand from the store, and why the gates in docs/GATES.md
+// have to be cleared rather than coded around.
 @interface ASDPurchase : NSObject
 
 /// Mandatory. PreparePurchaseTask keys the IXAppInstallCoordinator on it; nil produces

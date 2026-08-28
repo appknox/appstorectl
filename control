@@ -6,4 +6,4 @@ Description: Buy and install App Store apps from the shell. Hands an ASDPurchase
 Maintainer: vinay
 Author: vinay
 Section: Utilities
-Depends: ellekit, com.autopear.installipa
+Depends: ellekit, com.autopear.installipa, zip

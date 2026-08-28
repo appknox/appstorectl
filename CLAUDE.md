@@ -4,9 +4,13 @@ Project-specific guidance for working in this repo.
 
 ## What this is
 
-A CLI (`appstorectl`) that drives **appstored**'s real purchase pipeline over XPC to buy and install
-App Store apps from a shell, plus a tweak (**AutoConfirmSheet**) that dismisses the one dialog which
-would otherwise require a tap.
+A CLI (`appstorectl`) that drives **appstored**'s real purchase pipeline over XPC to buy, install
+and export App Store apps from a shell, plus a tweak (**AutoConfirmSheet**) that dismisses the one
+dialog which would otherwise require a tap.
+
+Source is split by concern: `appstorectl.m` owns purchase, install and dispatch; `export.m` packages
+an installed app; `biometric.m` is the gate 2 pre-flight. `appstorectl.h` is the seam between them
+and holds only what is genuinely shared. Keep it that way rather than growing `appstorectl.m`.
 
 It is not a store-protocol reimplementation. Everything goes through Apple's own daemons. When
 something fails, the cause is almost always a daemon-side rule, not our code.
@@ -55,6 +59,54 @@ invalidation arrives as a Darwin notification (`com.apple.itunesstored.accountsc
 only on a runloop turn. Sleeping blocks the thread, the notification never lands, and every re-read
 returns the same stale object forever — no amount of polling helps.
 
+## The biometric pre-flight
+
+`install` calls `biometricPreflight()` before spending a purchase. It exists because an account can
+be opted into biometric purchase auth (`BiometricStateEnabled = 2`) on a device with no enrolled
+identity — remove the passcode, and `+[ISBiometricStore shouldUseAutoEnrollment]` (URL-bag driven,
+server rollout, observed **YES**) silently re-opts the account in on the next sign-in. The store then
+demands an `X-Apple-TID-*` signature that cannot exist, answers with
+`MZCommerce.ConfirmPaymentSheet.Auth`, and no amount of sheet-dismissing produces a credential.
+
+Two constraints, both measured, both easy to undo by accident:
+
+**Clear BOTH keys.** `-[ISBiometricStore setBiometricState:]` writes `BiometricState`; the gate that
+matters, `-isBiometricStateEnabled`, reads `BiometricStateEnabled`, and nothing public writes it.
+Clearing only the first leaves the biometric branch armed while looking fixed.
+
+**Do it as uid 501.** These prefs live in mobile's domain. `appstorectl` runs as root, and as root
+the same reads return `BiometricState 0` / `isBiometricStateEnabled NO` — a confident clean bill of
+health for a domain no daemon consults. Hence the fork + `setuid(501)` + `execv` of the internal
+`_biometric-preflight` subcommand. It is fork+**exec**, not a bare fork, because the process has
+already touched ObjC, XPC and CoreFoundation.
+
+It only ever clears an opt-in that is already impossible to satisfy: enabled **and**
+`isIdentityMapValidForAccountIdentifier:` NO. An enrolled device keeps its biometric prompt. It never
+enables biometric auth, and it never fails the install — `--no-preflight` skips it entirely.
+
+## Export
+
+`export` reconstructs a `.ipa` from the installed container. It does **not** copy a downloaded file,
+because one never exists: `IXPromisedStreamingZipTransfer` extracts the archive while it is still
+downloading, and `/var/mobile/Media/Downloads/` holds only the queue database.
+
+What goes in: `Payload/<App>.app/` (with `SC_Info/` and `_CodeSignature/`) plus the container's
+`iTunesMetadata.plist`. What stays out: `BundleMetadata.plist` and
+`.com.apple.mobile_container_manager.metadata.plist`, which are device-local installd bookkeeping.
+
+**Validate against `SinfPaths` AND `SinfReplicationPaths`.** `SC_Info/Manifest.plist` has both keys
+and they differ. On Opera, `SinfPaths` lists one entry while `SinfReplicationPaths` lists all six
+including every `PlugIns/*.appex`. Checking only the first passes an archive missing every
+extension's sinf. On an app with no extensions the two are identical, which is exactly why this
+never shows up until you test a plugin-bearing app.
+
+**Zip with `-y`, and run zip inside the staging dir.** Without `-y` it follows symlinks inside the
+bundle and silently inflates the archive with duplicated frameworks. It has to run with the staging
+dir as cwd so paths come out rooted at `Payload/`, and since
+`posix_spawn_file_actions_addchdir_np` is unavailable on iOS, that is a fork + `chdir` + `execv`.
+
+Export never decrypts. `cryptid` stays 1. Do not add a decryption path here.
+
 ## The tweak's safety contract
 
 AutoConfirmSheet only ever **dismisses** — see `dismissSheet()` for the per-version selectors.
@@ -90,7 +142,17 @@ Known-good test targets: `com.netflix.Speedtest` (~1 MB, fast), `com.duckduckgo.
 
 Clearing gates 1 and 2 is a prerequisite for `--force-dismiss`. With a password or biometric check
 still active the sheet is an *auth prompt*, dismissing it yields no usable UUID, and the retry fails
-with `retry rejected` — which looks like a broken tweak but is not.
+with `retry rejected by the store` followed by the full server payload. That looks like a broken
+tweak and is not. Read `dialogId` in the payload to tell which gate:
+
+| dialogId | gate |
+|---|---|
+| `MZCommerce.ConfirmPaymentSheet` | none, the tweak handles this |
+| `MZCommerce.ConfirmPaymentSheet.Auth` | gate 2 armed but unsatisfiable |
+| `MZCommerce.TID.SignatureRequired` | gate 2 armed and enrolled |
+
+`authpref` with no arguments is a read and is safe. Passing a value **writes to the Apple ID
+server-side** and prompts for a password once, so do not run the write on a device mid-automation.
 
 ## Debugging
 

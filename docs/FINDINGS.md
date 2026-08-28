@@ -133,6 +133,79 @@ build — rather than a last-compatible one.
 
 Check `minOS` with `resolve` first.
 
+## The store .ipa never exists as a file
+
+`IXPromisedStreamingZipTransfer` extracts the archive **while it downloads**. Confirmed empirically:
+`/var/mobile/Media/Downloads/` holds only `downloads.28.sqlitedb`, the queue database, with zero
+payload at any point during or after an install.
+
+So there is no "grab the downloaded ipa" moment. `export` reconstructs the package from the
+installed container instead. The result is a genuine FairPlay-encrypted archive (`cryptid 1`,
+verified on the main binary and on all five of Opera's app extensions), but it is not byte-identical
+to Apple's: zip ordering differs, the `.sinf` is this Apple ID's, and the store already thinned the
+slice server-side (`variantID = 1:iPhone10,3:16`).
+
+Timestamps prove where the sinf comes from. On a FAST install, `SC_Info/FAST.sinf` carries the
+install time while `.supp`, `.supf`, `.supx` and `Manifest.plist` all carry the archive's own date
+from 2022. installd writes the sinf per Apple ID at install time; the rest ships in the ipa.
+
+## SinfPaths is not the list you want
+
+`SC_Info/Manifest.plist` holds two keys, and on an app with extensions they differ:
+
+```
+SinfPaths            => [ SC_Info/Opera.sinf ]                      1 entry
+SinfReplicationPaths => [ ...5 appex sinfs..., SC_Info/Opera.sinf ] 6 entries
+```
+
+Validating an export against `SinfPaths` alone passes an archive missing every extension's sinf.
+On an app with no extensions the two keys are identical, so this is invisible until a plugin-bearing
+app is tested. `export` takes the union.
+
+## Two biometric keys, and the public setter writes the wrong one
+
+`com.apple.itunesstored` holds both `BiometricState` and `BiometricStateEnabled`. Measured on
+16.7.12:
+
+| wrote | `-biometricState` | `-isBiometricStateEnabled` |
+|---|---|---|
+| `BiometricState = 0` only | `0` | **`YES`** |
+| both keys `= 0` | `0` | `NO` |
+
+`-[ISBiometricStore setBiometricState:]` is the only public setter and it writes the first key;
+`-isBiometricStateEnabled`, which gates the biometric branch, reads the second. Nothing public
+writes it, only the Settings opt-out via `ISBiometricOptInOperation _updateTouchIDSettingsForAccount:`.
+
+Note `docs/GATES.md` records `isBiometricStateEnabled` as `biometricState == 2` from the 15.8.1
+decompilation at `0x1ba753a78`. That may still hold there; the table above is a live read on 16.7.12.
+
+## Running as root reads the wrong preferences
+
+Two files exist, and only one matters:
+
+```
+/var/root/Library/Preferences/com.apple.itunesstored.plist      5 keys, created by our own tools
+/var/mobile/Library/Preferences/com.apple.itunesstored.plist   90 keys, what the daemons read
+```
+
+`appstored`, `itunesstored` and `installcoordinationd` all run as **mobile**. A root process reading
+`BiometricState` finds the key absent, returns `0`, and reports a clean bill of health for a domain
+no daemon consults. This silently inverted a diagnosis until caught. Anything touching these prefs
+must run as uid 501.
+
+The purchase session is unaffected by this: it belongs to appstored and resolves identically from
+any uid. Only in-process preference reads are per-uid.
+
+## The client's own expiry check is not what gates a purchase
+
+`+[SSAccountStore isExpiredForTokenType:]` is `now > LastAuthTime + 900.0` (the interval is a bare
+`ldr d0` of the double at `0x192ba3d28`), and a missing `LastAuthTime` counts as expired.
+
+Observed during a **successful** purchase: `isExpired` YES for token types 0, 1 and 2, with
+`LastAuthTime` 32 hours stale. `resetExpirationForTokenType:` is what writes that key, and the AMS
+payment-sheet auth path never calls it. So the client sits permanently "expired" while purchases
+work fine on a separate, server-side clock. Do not use it as a health signal.
+
 ## Smaller things
 
 - **`ASDPurchaseResult.itemID` is nil even on success.** Check `success`, then verify the install

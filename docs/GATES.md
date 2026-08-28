@@ -42,8 +42,21 @@ This setting lives on the Apple ID and syncs to every device on that account.
 ```
 
 `BiometricState = 2` in `com.apple.itunesstored.plist` means biometric purchase auth is on. This is
-the mechanism behind the `MZCommerce.TID.SignatureRequired` dialog the store returns — TID is Touch
-ID, and the signature travels in the `X-Apple-TID-*` headers.
+the mechanism behind the `MZCommerce.TID.SignatureRequired` dialog the store returns — the signature
+travels in the `X-Apple-TID-*` headers. "TID" is Apple's naming for the device biometric generally,
+not specifically Touch ID; a Face ID device uses the same headers and selectors.
+
+> **Two keys, and the decompilation above is not the whole story on 16.7.12.** The plist holds both
+> `BiometricState` and `BiometricStateEnabled`, read by different accessors. Live on 16.7.12:
+> writing `BiometricState = 0` alone leaves `-isBiometricStateEnabled` returning **YES**; it only
+> flips to NO once `BiometricStateEnabled` is also `0`. `-[ISBiometricStore setBiometricState:]`,
+> the only public setter, writes just the first — so clearing it alone leaves the biometric branch
+> armed. Full writeup in the research archive, `docs/11-auth-expiry.md`.
+>
+> Related: `+[ISBiometricStore shouldUseAutoEnrollment]` is URL-bag driven and was **YES** on
+> 16.7.12, so the server can silently re-opt an account into biometric auth on sign-in. A device
+> with no passcode then ends up opted into a biometric it cannot perform, and every purchase falls
+> back to a password prompt (`MZCommerce.ConfirmPaymentSheet.Auth`).
 
 Clearing it is a Settings action, not a plist write. `ISBiometricStore` also has
 `registerAccountIdentifier:`, `createX509CertChainDataForAccountIdentifier:purpose:error:` and
