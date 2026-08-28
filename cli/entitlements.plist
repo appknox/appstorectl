@@ -12,5 +12,21 @@
 	     returns ASDErrorDomain 505 instead. Verified by bisecting one entitlement at a time. -->
 	<key>com.apple.itunesstored.private</key>
 	<true/>
+
+	<!-- `login`. +[SSAuthenticateRequest _isAuthkitEntitled] returns YES for either of these, and
+	     without one the request is shipped to itunesstored over XPC rather than run in process, so
+	     a two-factor challenge can be neither presented nor answered. -->
+	<key>com.apple.authkit.client.private</key>
+	<true/>
+	<key>com.apple.authkit.client.internal</key>
+	<true/>
+
+	<!-- `logout`. -[ACDAccountStoreFilter _isClientPermittedToRemoveAccount:] in accountsd allows
+	     a removal on a type-independent entitlement, one of two type-specific ones, or the client
+	     owning the account. We never own an account created through SSAuthenticateRequest. This is
+	     the type-independent one, bisected on device; without it accountsd answers
+	     com.apple.accounts code 7. -->
+	<key>com.apple.private.accounts.allaccounts</key>
+	<true/>
 </dict>
 </plist>

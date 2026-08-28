@@ -11,7 +11,7 @@
 [![Built with Theos](https://img.shields.io/badge/built%20with-Theos-FF6B35?style=flat-square)](https://theos.dev)
 [![Status](https://img.shields.io/badge/status-working-2EA043?style=flat-square)](#)
 
-**[How it works](docs/HOW-IT-WORKS.md)** · [Quick start](#quick-start) · [Commands](#commands) · [Gates](#authorization-gates)
+**[How it works](docs/HOW-IT-WORKS.md)** · [Quick start](#quick-start) · [Commands](#commands) · [Gates](#authorization-gates) · [Accounts](docs/ACCOUNTS.md)
 
 </div>
 
@@ -76,6 +76,11 @@ appstorectl export    <bundle-id> [-o <path>]
 appstorectl resolve   <bundle-id>
 appstorectl uninstall <bundle-id>
 appstorectl jobs
+
+appstorectl accounts
+appstorectl login     <apple-id> [--password-file <path>] [--show-password] [--no-bootstrap]
+appstorectl logout    <apple-id> [--force]
+
 authpref              [free|paid never|sometimes|always]
 ```
 
@@ -86,7 +91,19 @@ authpref              [free|paid never|sometimes|always]
 | `-o <path>` | export destination. Default `/var/jb/tmp/appstorectl-exports/` |
 | `--adam <id>` | skip the store lookup and use this adamId |
 | `--no-preflight` | skip the biometric pre-flight (see [gates](#authorization-gates)) |
+| `--password-file` | read the Apple ID password from a file instead of a prompt |
+| `--show-password` | echo the password as you type it, to check it is read correctly |
+| `--no-bootstrap` | `login` fails instead of asking for a verification code. For unattended use |
+| `--force` | `logout` will remove the **active** account |
 | `-q` | errors only |
+
+> [!IMPORTANT]
+> **The first `login` for an Apple ID on a device needs a verification code typed by a human.** After
+> that it is unattended for that pair. `login` asks for the code itself; there is no second tool to
+> run. See **[docs/ACCOUNTS.md](docs/ACCOUNTS.md)**.
+>
+> `logout` is the only way to remove an account: Settings lists only the *active* one, so anything
+> else is invisible there.
 
 > [!CAUTION]
 > `resolve` is the safe way to inspect an app: it prints adamId, price and minOS and buys nothing.
@@ -345,6 +362,36 @@ placeholder, leaving no orphan icon.
 
 ---
 
+## TODO
+
+### Distribution and reach
+
+- [ ] **Decryption support.** `export` currently produces a still-encrypted archive, `cryptid 1`. Decrypting is a separate problem and deliberately out of scope so far.
+- [ ] **Ship the CLI as a `.tipa`.** Reaches stock devices with TrollStore and drops the ElleKit dependency. The tweak half stays a tweak, because dismissing the confirmation sheet means injecting into PassbookUIService and a TrollStore app cannot inject into another process. So a TIPA build is hands-off up to a final manual tap. Two things to settle first: TrollStore's version window (roughly iOS 14.0 to 16.6.1, which would exclude 16.7.x), and whether `com.apple.itunesstored.private` still opens appstored's service catalog when granted that way.
+- [ ] **A Mac-side CLI.** A better interface than SSH-as-root for anyone who is not the author, and independent of the TIPA question.
+- [ ] **Expose a server on device for it to talk to.** Local HTTP over USB via `iproxy`, the same transport already used for `ssh -p 2222`.
+
+### Multi-region
+
+- [x] ~~Multi-region on **one** account.~~ **Ruled out.** The storefront can be changed client-side with no authentication and the server honours it, then refuses the purchase because the account is not valid for that region: `-128 MZCommerce.CountryMismatch`. There is no client-reachable lever on that check.
+- [x] ~~Sign a second, region-owning account in headlessly.~~ Done — `login` / `logout` / `accounts`, see [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
+- [ ] **Use the multi-account sign-in to actually switch regions.** The point of all of it, and the pieces now exist separately: hold one signed-in account per storefront, make the one that owns the target region active, install, and put the previous account back. As a workflow that is roughly `appstorectl install <bundle-id> --region in`, resolving the region to an account the device already holds and failing with something useful when it holds none. Depends on the two items below.
+- [ ] **A `switch` command.** Making a signed-in account the active one works and is reversed in [docs/AUTH-INTERNALS.md](docs/AUTH-INTERNALS.md), but it is still only in a research probe. Needs a guard that refuses to leave the device with no active authenticated account — without one it is easy to strand a device in a state only a Settings sign-in can recover from.
+- [ ] **Prove a purchase actually routes to the other region.** The device storefront does follow the active account, but the end-to-end A/B has never been validly run. `resolve` is likely the wrong instrument, since it queries `itunes.apple.com/lookup` by locale rather than by the storefront header. Needs an observed `X-Apple-Store-Front` on a real store request, or an actual purchase.
+
+### Authentication
+
+- [ ] **Where two-factor trust is kept, and for how long.** `-5000` is understood and the workflow around it is solid, but the mechanism is not: unknown whether the trust is a local artifact or a server-side device record, what its lifetime is, and what revokes it. Matters because the answer decides whether a fleet needs the interactive step once per device or periodically.
+- [ ] **Whether a challenge can be forced.** When the device already holds cached identity for an Apple ID, AuthKit signs in without ever challenging, which establishes no store trust and leaves that account permanently stuck at `-5000`. No known way out from a shell.
+
+### Housekeeping
+
+- [ ] `cli/login.m` is 219 lines. Splitting the password reading into its own file brings it back under the limit.
+- [ ] The update and redownload paths (`isUpdate`, `isRefresh`, `bagKey`) are unexercised.
+- [ ] `export` is untested against On-Demand Resources and Watch apps.
+
+---
+
 ## Layout
 
 ```
@@ -352,10 +399,17 @@ cli/
 ├── appstorectl.m        purchase, install, dispatch
 ├── export.m/.h          package an installed app back into an encrypted ipa
 ├── biometric.m/.h       the gate 2 pre-flight
+├── account.m            account listing and shared plumbing
+├── login.m              sign an Apple ID in
+├── logout.m             remove an account
+├── authkit.m            the one-off two-factor bootstrap
+├── account.h            the seam for the three account commands
 ├── appstorectl.h        the seam shared between the above
 ├── authpref.m           purchase password settings
 ├── ASDPrivate.h         private interfaces, annotated
-└── entitlements.plist   com.apple.itunesstored.private
+├── SSAuthPrivate.h      StoreServices authentication interfaces
+├── AKPrivate.h          AuthKit interfaces
+└── entitlements.plist   itunesstored + authkit + accounts entitlements
 tweak/
 ├── Tweak.x              the dismissal hook
 └── AutoConfirmSheet.plist
@@ -363,6 +417,8 @@ docs/
 ├── HOW-IT-WORKS.md      the end-to-end walkthrough, start here
 ├── PIPELINE.md          how a purchase actually flows
 ├── GATES.md             the three gates and how each was found
+├── ACCOUNTS.md          signing Apple IDs in and out
+├── AUTH-INTERNALS.md    why sign-in works the way it does
 └── FINDINGS.md          the non-obvious details
 ```
 

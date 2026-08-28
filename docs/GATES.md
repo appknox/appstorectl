@@ -6,7 +6,7 @@ this confusing to debug from the outside.
 
 | # | Gate | Where it lives | Clear it with |
 |---|---|---|---|
-| 1 | Password for free downloads | Apple ID account setting, server-synced | `authpref free never` |
+| 1 | Password for free downloads | Apple ID account setting, server-synced | `authpref free never`, **or nothing at all**, see below |
 | 2 | Biometric signature | device — `BiometricState` | Settings → Touch ID & Passcode → iTunes & App Store off |
 | 3 | Confirmation sheet | PassbookUIService, PassKit remote alert | `--force-dismiss` + AutoConfirmSheet |
 
@@ -33,6 +33,62 @@ unconfigured still prompts.
 `sometimes`. Apple enforces a floor on paid purchases.
 
 This setting lives on the Apple ID and syncs to every device on that account.
+
+### Gate 1 is not actually a prerequisite
+
+Verified on iPhone10,3 / 16.7.12 with `<test-account>`, `2026-08-27`.
+
+When the setting is `unset (0)` the store does not refuse the purchase. It asks, by returning a
+second dialog after the confirmation sheet:
+
+```
+dialogId          MZCommerce.ASN.AlwaysSometimes.MediaAndPurchases
+message           Require password for additional purchases on this device?
+okButtonString    Require After 15 Minutes      -> okButtonAction.buyParams  asn=2
+cancelButtonString Always Require               -> cancelButtonAction.buyParams asn=1
+```
+
+Both button actions carry a **complete** `buyParams` string, including the
+`confirmedPaymentUUID` from the first sheet plus `hasBeenAuthedForBuy=true` and
+`hasConfirmedPaymentSheet=true`. Replaying `okButtonAction.buyParams` answers the question and the
+purchase completes. `cmdInstall` now loops on this rather than retrying once, because the store asks
+twice and a single retry left the second question unanswered.
+
+**The account preference is not written by this.** `authpref` still reads `unset (0)` after a
+successful install, checked immediately afterwards. The dialog is answered for that purchase only,
+which is why this works on an account where `authpref free never` itself cannot run.
+
+Observed end to end on `com.netflix.Speedtest` (2 MB, chosen so the purchase dominates the log),
+`2026-08-27`, account still at `unset (0)` before and after:
+
+```console
+$ appstorectl install com.netflix.Speedtest --force-dismiss --export
+[+] purchasing com.netflix.Speedtest (adamId 1133348139)
+    attempt with purchaseID 6416205                                   <- 1: ConfirmPaymentSheet
+[+] store returned a dialog with confirmedPaymentUUID; resending (round 1)
+    attempt with purchaseID 1486764                                   <- 2: ASN dialog
+[dialog] store requested a dialog
+[dialog] replied nil; dialogs are answered by replaying buyParams
+[+] store returned a dialog with confirmedPaymentUUID; resending (round 2)
+    attempt with purchaseID 6377010                                   <- 3: completes
+[+] purchased, waiting for install
+```
+
+Three attempts, two replays. A fresh `purchaseID` per attempt is required, otherwise the store
+dedupes the retry onto the first one.
+
+The `[dialog] replied nil` line is the repaired result-handler being invoked. That call site is
+exactly where `--accept` used to die (`KERN_INVALID_ADDRESS at 0x1`), so this trace doubles as the
+regression check for it.
+
+That last point matters, because on this account it *cannot* run:
+`UpdateAccountPasswordSettingsOperation` requires a secure token the account does not hold, and the
+account is stuck at `SSServerErrorDomain -5000` (no two-factor store trust for this device). Full
+reverse in [storefront-research/docs/19](../../storefront-research/docs/19-update-password-settings.md).
+So the practical rule is:
+
+- `authpref free never` is an **optimisation**: it removes one round trip per install.
+- It is **not** required. An account that cannot run it still installs fine.
 
 ## Gate 2 — biometric signature
 

@@ -27,6 +27,7 @@
 #import <sys/wait.h>
 
 #import "ASDPrivate.h"
+#import "account.h"
 #import "appstorectl.h"
 #import "biometric.h"
 #import "export.h"
@@ -129,12 +130,30 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName) {
     [self answer:handler what:"auth"];
 }
 
+// The handler's arity and argument types are not in any header, and guessing wrong is a crash
+// rather than an error. Declaring it ^(BOOL, id) and calling blk(YES, nil) put the literal 0x1 in
+// the first slot, NSXPC ran objc_opt_isKindOfClass on it, and the process died with
+// EXC_BAD_ACCESS / KERN_INVALID_ADDRESS at 0x1 inside
+// -[NSXPCConnection _decodeAndInvokeMessageWithEvent:reply:flags:]. The first parameter is an
+// object pointer, not a BOOL. Passing NO only ever "worked" because 0 is a valid nil.
+//
+// @try does not help: it catches ObjC exceptions, not SIGSEGV.
+//
+// Note the difference from the no-argument rule in ASDPrivate.h. That rule holds when the callee
+// ignores its arguments, because the extra registers are then never read. This callee provably
+// reads slot 1, so invoking a no-arg block here would hand it whatever garbage x1 happened to
+// hold, which is worse than nil. The one register state observed safe across every run is all
+// zero, so pass explicit NULLs. void * slots keep ARC from emitting objc_storeStrong on them.
+//
+// The consequence is that this cannot express accept vs decline, and it never could. Answering a
+// dialog affirmatively is done by replaying the server's okButtonAction.buyParams in cmdInstall,
+// which needs no observer.
 - (void)answer:(id)handler what:(const char *)what {
     if (!handler) return;
     @try {
-        void (^blk)(BOOL, id) = handler;
-        blk(self.autoAccept, nil);
-        note(@"[%s] answered %@", what, self.autoAccept ? @"accept" : @"decline");
+        void (^blk)(void *, void *, void *, void *) = handler;
+        blk(NULL, NULL, NULL, NULL);
+        note(@"[%s] replied nil; dialogs are answered by replaying buyParams", what);
     } @catch (NSException *e) {
         note(@"[%s] could not answer: %@", what, e.reason);
     }
@@ -483,14 +502,42 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
 
     // The store asked for confirmation and told us what to resend. Do exactly that.
     // With --force-dismiss the tweak answers the sheet and this path is usually not needed.
-    if (!ok && retryParams) {
-        note(@"[+] store returned a confirmation with confirmedPaymentUUID; resending");
-        if (!attempt(retryParams)) { note(@"[-] retry timed out"); disarm(); return 4; }
-        if (!ok) {
-            note(@"[-] retry rejected by the store");
-            describeError(lastError);
-            explainDialogKind(storeDialogKind(lastError));
+    //
+    // It can ask more than once, and a single retry is not enough. Observed on a free install
+    // whose account had freeDownloadsPasswordSetting unset (0):
+    //
+    //   attempt 1 -> MZCommerce.ConfirmPaymentSheet
+    //   attempt 2 -> MZCommerce.ASN.AlwaysSometimes.MediaAndPurchases
+    //                "Require password for additional purchases on this device?"
+    //
+    // Each rejection carries its own okButtonAction.buyParams, so the second one is the server
+    // telling us how to answer the ASN question (asn=2, "Require After 15 Minutes") while keeping
+    // the confirmedPaymentUUID from the first. Replaying it is answering the dialog, and it needs
+    // no dialog observer, which is why this path is preferred over --accept.
+    //
+    // Bounded two ways: a hard cap, and a check that the params actually changed. Identical
+    // buyParams twice means the replay is not making progress and looping would only spend
+    // purchase attempts against the store.
+    NSMutableSet *seenParams = [NSMutableSet set];
+    BOOL replayed = NO;
+    for (int round = 1; !ok && retryParams.length && round <= 4; round++) {
+        if ([seenParams containsObject:retryParams]) {
+            note(@"[-] store repeated the same buyParams; not replaying again");
+            break;
         }
+        [seenParams addObject:retryParams];
+
+        note(@"[+] store returned a dialog with confirmedPaymentUUID; resending (round %d)", round);
+        replayed = YES;
+        if (!attempt(retryParams)) { note(@"[-] retry timed out"); disarm(); return 4; }
+    }
+
+    // Only report a rejection for a replay we actually made. A first attempt that failed without
+    // any buyParams has already printed its own diagnosis inside the attempt block.
+    if (!ok && replayed) {
+        note(@"[-] retry rejected by the store");
+        describeError(lastError);
+        explainDialogKind(storeDialogKind(lastError));
     }
 
     disarm();   // the sheet is behind us either way; do not leave the tweak armed
@@ -561,6 +608,15 @@ static void usage(void) {
         "  appstorectl resolve   <bundle-id>\n"
         "  appstorectl uninstall <bundle-id>\n"
         "  appstorectl jobs\n\n"
+        "  appstorectl accounts\n"
+        "  appstorectl login    <apple-id> [--password-file <path>] [--show-password] [--no-bootstrap]\n"
+        "  appstorectl logout   <apple-id> [--force]\n\n"
+        "  login reads the password from --password-file, then $APPSTORECTL_PASSWORD, then a\n"
+        "  terminal prompt. Never pass it on the command line; ps would show it.\n"
+        "  --show-password echoes what you type, to check it is being read correctly.\n"
+        "  The first login for an Apple ID on a device needs a verification code typed once;\n"
+        "  login asks for it automatically. --no-bootstrap fails instead, for unattended use.\n"
+        "  logout is the only way to remove an account: Settings lists only the active one.\n\n"
         "  --export     after installing, package the app as an encrypted .ipa\n"
         "  --no-preflight  skip the biometric pre-flight (see docs/GATES.md gate 2)\n"
         "  -o <path>    export destination (default /var/jb/tmp/appstorectl-exports/)\n"
@@ -598,7 +654,11 @@ int main(int argc, char **argv) {
         BOOL forceDismiss = NO;
         BOOL alsoExport = NO;
         BOOL skipPreflight = NO;
+        BOOL force = NO;
+        BOOL showPassword = NO;
+        BOOL allowBootstrap = YES;
         NSString *exportPath = nil;
+        NSString *passwordFile = nil;
 
         for (int i = 2; i < argc; i++) {
             NSString *a = @(argv[i]);
@@ -607,7 +667,14 @@ int main(int argc, char **argv) {
             if ([a isEqualToString:@"--force-dismiss"]) { forceDismiss = YES; continue; }
             if ([a isEqualToString:@"--export"])        { alsoExport = YES;   continue; }
             if ([a isEqualToString:@"--no-preflight"])  { skipPreflight = YES; continue; }
+            if ([a isEqualToString:@"--force"])         { force = YES;      continue; }
+            if ([a isEqualToString:@"--show-password"]) { showPassword = YES; continue; }
+            if ([a isEqualToString:@"--no-bootstrap"])  { allowBootstrap = NO; continue; }
             if ([a isEqualToString:@"-q"])         { gQuiet = YES;     continue; }
+            if ([a isEqualToString:@"--password-file"] && i + 1 < argc) {
+                passwordFile = @(argv[++i]);
+                continue;
+            }
             if ([a isEqualToString:@"-o"] && i + 1 < argc) {
                 exportPath = @(argv[++i]);
                 continue;
@@ -622,8 +689,14 @@ int main(int argc, char **argv) {
         // Internal, re-exec'd as mobile by biometricPreflight(). Not in usage on purpose.
         if ([cmd isEqualToString:@"_biometric-preflight"]) return cmdBiometricPreflight();
 
-        if ([cmd isEqualToString:@"jobs"]) return cmdJobs();
+        if ([cmd isEqualToString:@"jobs"])     return cmdJobs();
+        // Account commands take an Apple ID, not a bundle id, so they are dispatched before the
+        // positional argument below is named `bundleID`.
+        if ([cmd isEqualToString:@"accounts"]) return cmdAccounts();
         if (pos.count < 1) { usage(); return 64; }
+        if ([cmd isEqualToString:@"login"])    return cmdLogin(pos[0], passwordFile, showPassword, allowBootstrap);
+        if ([cmd isEqualToString:@"logout"])   return cmdLogout(pos[0], force);
+
         NSString *bundleID = pos[0];
 
         if ([cmd isEqualToString:@"resolve"])   return resolveAdamID(bundleID, NULL) ? 0 : 66;

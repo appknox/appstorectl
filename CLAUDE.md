@@ -5,18 +5,31 @@ Project-specific guidance for working in this repo.
 ## What this is
 
 A CLI (`appstorectl`) that drives **appstored**'s real purchase pipeline over XPC to buy, install
-and export App Store apps from a shell, plus a tweak (**AutoConfirmSheet**) that dismisses the one
-dialog which would otherwise require a tap.
+and export App Store apps from a shell, signs Apple IDs in and out, plus a tweak
+(**AutoConfirmSheet**) that dismisses the one dialog which would otherwise require a tap.
 
-Source is split by concern: `appstorectl.m` owns purchase, install and dispatch; `export.m` packages
-an installed app; `biometric.m` is the gate 2 pre-flight. `appstorectl.h` is the seam between them
-and holds only what is genuinely shared. Keep it that way rather than growing `appstorectl.m`.
+Source is split by concern, and no file should grow past roughly 200 lines:
+
+| file | owns |
+|---|---|
+| `appstorectl.m` | purchase, install, dispatch |
+| `export.m` | packaging an installed app back into an ipa |
+| `biometric.m` | the gate 2 pre-flight |
+| `account.m` | account listing and the plumbing the other two share |
+| `login.m` | signing an Apple ID in |
+| `logout.m` | removing an account |
+| `authkit.m` | the one-off two-factor bootstrap |
+
+`appstorectl.h` and `account.h` are the seams and hold only what is genuinely shared. Private
+interfaces live in `ASDPrivate.h` (purchase), `SSAuthPrivate.h` (store authentication) and
+`AKPrivate.h` (AuthKit), annotated, never scattered across `.m` files.
 
 It is not a store-protocol reimplementation. Everything goes through Apple's own daemons. When
 something fails, the cause is almost always a daemon-side rule, not our code.
 
-Read [`cli/ASDPrivate.h`](cli/ASDPrivate.h) before touching either tool — it documents the
-non-obvious constraints inline.
+Read [`cli/ASDPrivate.h`](cli/ASDPrivate.h) before touching either tool, and
+[`docs/AUTH-INTERNALS.md`](docs/AUTH-INTERNALS.md) before touching anything account-related. Both
+document the non-obvious constraints.
 
 ## Build and deploy
 
@@ -58,6 +71,32 @@ over-declare as four `void *`, print the raw registers.
 invalidation arrives as a Darwin notification (`com.apple.itunesstored.accountschanged`), delivered
 only on a runloop turn. Sleeping blocks the thread, the notification never lands, and every re-read
 returns the same stale object forever — no amount of polling helps.
+
+**Never trust a completion; re-read the account store.** Sign-in and removal completions both fire
+*before* accountsd's accounts-changed notification is delivered, so a read taken immediately sees the
+cached snapshot. This reported a successful removal as a failure. `waitForAccount()` spins the
+runloop, which is what delivers it. And `startWithAuthenticateResponseBlock:` returns
+`authenticateResponseType 4` from its skip branch **having contacted nobody**, so a reported success
+is not evidence of one.
+
+**`promptStyle` must be 1 for a real sign-in.** At its default of 0,
+`_shouldRunAuthenticationForAccount:` only authenticates when the token is expired, and otherwise
+returns that fake success above.
+
+**`-5000` is not a wrong password.** It means the device holds no two-factor-established trust for
+that Apple ID. Only AuthKit can fix that, only with a code typed by a human, and only once per
+(Apple ID, device). Full measurements in [`docs/AUTH-INTERNALS.md`](docs/AUTH-INTERNALS.md).
+
+**Apple's account lookup is case-sensitive; ours is not.** `ams_iTunesAccountWithAltDSID:DSID:username:`
+misses on `Me@` vs `me@`, falls into the create branch, and the save is then refused with
+`com.apple.accounts` 5 "Only a single iTunes Store account is allowed to be saved". `findAccount()`
+compares case-insensitively and will happily *find* an account Apple's lookup did not, which hides
+this. Do not "fix" either side to match without understanding that.
+
+**Do not call `setActiveAccount:`.** It forces `verifyCredentials:1`, the call behind
+`AMSErrorDomain 11`. Apple's own log says to use `setActive:` plus
+`saveAccount:verifyCredentials:NO`. And never leave the device with no active authenticated account:
+it cannot bootstrap out of that from a shell, only a Settings sign-in recovers it.
 
 ## The biometric pre-flight
 
