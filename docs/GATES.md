@@ -205,8 +205,10 @@ rather than lie about a confirmed sheet. Only tested on an account whose
 `freeDownloadsPasswordSetting` has settled to `never`. Not tested against Ask to Buy or a device
 that requires a biometric signature.
 
-`--force-dismiss` therefore defaults to **off**. The tweak still ships, because `--adam` withholds
-the two params and the account states above are unmapped.
+`--force-dismiss` therefore defaults to **off**, and the tweak is no longer built into the package
+at all — `tweak` is off the `SUBPROJECTS` line. The flag still exists, because `--adam` withholds
+the two params and the account states above are unmapped, but with nothing installed to read the
+flag it warns rather than silently doing nothing. Adding `tweak` back to `SUBPROJECTS` restores it.
 
 ### It is not answerable through appstored
 

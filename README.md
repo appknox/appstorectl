@@ -53,7 +53,7 @@ export THEOS=~/theos
 make do THEOS_DEVICE_IP=<device-ip>
 ```
 
-`make do` builds, packages, installs over SSH, and restarts PassbookUIService so the tweak loads. Set `THEOS_DEVICE_PORT` when SSH is not on port 22.
+`make do` builds, packages and installs over SSH. Set `THEOS_DEVICE_PORT` when SSH is not on port 22.
 
 To install a built package manually:
 
@@ -145,7 +145,9 @@ Three independent conditions can require interaction:
 2. Biometric purchase authorization. The preflight only clears an enabled state that has no valid enrolled identity. It leaves a working Face ID or Touch ID configuration alone.
 3. The ordinary purchase confirmation sheet. **No longer raised for a free app.** The purchase now carries `hasBeenAuthedForBuy` and `hasConfirmedPaymentSheet`, which is what Apple's own internal App Store CLI sends for a free or already-owned app, and the store does not ask.
 
-Because nothing asks, nothing needs dismissing. `--force-dismiss` is **off by default**. It still exists, and AutoConfirmSheet still ships, for the cases the buy params do not cover: `--adam` withholds them, and Ask to Buy and required-biometric accounts are untested against the new path.
+Because nothing asks, nothing needs dismissing. **AutoConfirmSheet is no longer built into the package** — nothing is injected into PassbookUIService, and the package no longer depends on `ellekit`. Its source stays in `tweak/`; adding `tweak` back to `SUBPROJECTS` in the top-level `Makefile` restores it.
+
+`--force-dismiss` still exists and still arms the flag, for the cases the buy params do not cover: `--adam` withholds them, and Ask to Buy and required-biometric accounts are untested against the new path. With no tweak installed it warns that nothing will act on the flag.
 
 When armed, `--force-dismiss` creates `/var/jb/tmp/.autoconfirm`. The tweak accepts a flag for at most five minutes and consumes it when the first matching sheet appears. It acts only inside PassbookUIService and only on `PKPaymentAuthorizationRemoteAlertViewController`, and it dismisses — it never approves or authorizes a payment. The CLI removes the flag when the purchase call ends normally.
 

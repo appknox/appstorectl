@@ -1,11 +1,14 @@
 # Development notes
 
-appstorectl is a Theos aggregate project with three components:
+appstorectl is a Theos aggregate project. Two components are built into the package:
 
 - `cli/`: purchase, account, install, export, and logging commands
 - `cli/store/`: everything that talks to the store's own frameworks rather than to appstored
 - `decrypt/`: separately entitled helper for reading decrypted process memory
-- `tweak/`: AutoConfirmSheet injection for PassbookUIService, no longer on the default install path
+
+and one is in the tree but **not** in `SUBPROJECTS`:
+
+- `tweak/`: AutoConfirmSheet injection for PassbookUIService. See below.
 
 `cli/store/` exists so that private-framework surface stays in one place instead of accreting in
 `appstorectl.m`:
@@ -106,10 +109,11 @@ Important decrypt constraints:
 
 ## AutoConfirmSheet
 
-Off the default path since 2026-08-29: the buy params stop the store raising a sheet, so
-`--force-dismiss` defaults to off and no flag is created. It is kept as the fallback for `--adam`
-and for account states the buy params have not been tested against. Everything below still applies
-whenever it is armed.
+**Not built into the package since 2026-08-29.** The buy params stop the store raising a sheet, so
+`--force-dismiss` defaults to off and the tweak had nothing left to dismiss; `tweak` is off the
+`SUBPROJECTS` line and the package no longer depends on `ellekit`. The source is kept, and adding
+`tweak` back to `SUBPROJECTS` is the whole of restoring it — which is worth doing if `--adam` or an
+untested account state ever needs it. Everything below applies whenever it is built and armed.
 
 The tweak may dismiss the purchase-confirmation controller; it must never confirm or authorize a
 payment. Keep all three gates:

@@ -648,10 +648,15 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
             [files removeItemAtPath:kAutoConfirmFlag error:NULL];
             return 3;
         }
-        if (tweakInstalled)
-            logLine(@"force-dismiss armed; AutoConfirmSheet is installed");
-        else
-            logLine(@"force-dismiss armed, but AutoConfirmSheet is not installed — no effect");
+        if (tweakInstalled) {
+            note(@"[+] force-dismiss armed; AutoConfirmSheet is installed");
+        } else {
+            // The package stopped shipping the tweak, so this is the normal case now, not an edge
+            // one. Say it on the terminal: someone passing --force-dismiss is expecting a sheet to
+            // be handled, and silently arming a flag nothing reads would let them wait for it.
+            warnf(@"--force-dismiss armed, but AutoConfirmSheet is not installed, so nothing will "
+                   "dismiss a sheet. It is not in this package; build it from tweak/ if you need it.");
+        }
     }
     void (^disarm)(void) = ^{
         if (!forceDismiss) return;
