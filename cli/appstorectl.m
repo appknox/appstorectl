@@ -31,6 +31,7 @@
 
 #import "store/AMSPrivate.h"
 #import "store/buyparams.h"
+#import "store/library.h"
 #import "store/versions.h"
 #import "ASDPrivate.h"
 #import "account.h"
@@ -235,6 +236,37 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName, NSNumber 
 
 
 #pragma mark - Version enumeration
+
+static int cmdLibrary(NSString *filter) {
+    NSError *err = nil;
+    NSArray<LibraryApp *> *apps = accountLibrary(filter.length ? @[filter] : nil, &err);
+    if (!apps) {
+        warnf(@"could not read the library: %@", err.localizedDescription ?: @"unknown");
+        printErrorChain(err, 1);
+        return 1;
+    }
+    if (!apps.count) { note(@"[=] nothing in this account's library%@",
+                            filter.length ? @" for that bundle id" : @""); return 0; }
+
+    // %-44@ does not pad an NSString the way %-44s pads a C string, so pad explicitly.
+    NSString *(^col)(NSString *, NSUInteger) = ^(NSString *s, NSUInteger width) {
+        s = s.length ? s : @"-";
+        return s.length >= width ? s
+             : [s stringByPaddingToLength:width withString:@" " startingAtIndex:0];
+    };
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"yyyy-MM-dd";
+
+    note(@"  %@ %@ %@ %@", col(@"BUNDLE ID", 44), col(@"ADAM ID", 12),
+         col(@"PURCHASED", 10), @"TITLE");
+    for (LibraryApp *app in apps)
+        note(@"  %@ %@ %@ %@%@",
+             col(app.bundleID, 44), col(app.storeItemID.stringValue, 12),
+             col(app.datePurchased ? [fmt stringFromDate:app.datePurchased] : nil, 10),
+             app.title ?: @"", app.hidden ? @"  (hidden)" : @"");
+    note(@"[+] %lu app(s)", (unsigned long)apps.count);
+    return 0;
+}
 
 /// Dump the store's metadata lookup for a bundle id. Undocumented on purpose: it is a research
 /// affordance, not a feature, and the shape it prints is Apple's, not ours.
@@ -561,12 +593,25 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
     // with the AutoConfirmSheet tweak removed from the device entirely.
     //
     // Only when the lookup said the price is 0. See the gate above for why that matters.
+    // STDQ buys, STDRDL redownloads. Sending STDQ for something already in the locker asks the
+    // store for the wrong thing; asclient picks on the owned flag
+    // (-[Installer _purchaseApp:] 0x100111db0), and appstored's own cached redownload-params for an
+    // installed app read pricingParameters=STDRDL. The locker query is a round trip through
+    // appstored, so a failure here is not fatal — fall back to STDQ, which is what shipped before.
+    NSError *libErr = nil;
+    LibraryApp *owned = libraryEntryForBundleID(bundleID, &libErr);
+    if (libErr) logLine(@"install: locker lookup failed (%@); assuming not owned",
+                        libErr.localizedDescription);
+    NSString *pricing = owned ? @"STDRDL" : @"STDQ";
+    if (owned) note(@"[=] already in this account's library; redownloading");
+
     p.buyParameters = knownFree
         ? [NSString stringWithFormat:
-              @"salableAdamId=%@&productType=C&price=0&pricingParameters=STDQ"
-              @"&hasBeenAuthedForBuy=true&hasConfirmedPaymentSheet=true", adamID]
+              @"salableAdamId=%@&productType=C&price=0&pricingParameters=%@"
+              @"&hasBeenAuthedForBuy=true&hasConfirmedPaymentSheet=true", adamID, pricing]
         : [NSString stringWithFormat:
-              @"salableAdamId=%@&productType=C&price=0&pricingParameters=STDQ", adamID];
+              @"salableAdamId=%@&productType=C&price=0&pricingParameters=%@", adamID, pricing];
+    p.isRedownload = owned != nil;
     // Pin a specific build. appExtVrsId is the key on the normal (DSID-carrying) path;
     // externalVersionId is the DSID-less spelling, and asclient sends that one only when it is
     // installing DSID-less: -[Installer _purchaseApp:] (0x100111db0). We are never DSID-less here.
@@ -870,6 +915,7 @@ static void usage(void) {
         "  appstorectl export    <bundle-id> [-o <path>]\n"
         "  appstorectl resolve   <bundle-id>\n"
         "  appstorectl versions  <bundle-id>\n"
+        "  appstorectl library   [<bundle-id>]\n"
         "  appstorectl uninstall <bundle-id>\n"
         "  appstorectl jobs\n"
         "  appstorectl version\n\n"
@@ -998,6 +1044,7 @@ int main(int argc, char **argv) {
         // Account commands take an Apple ID, not a bundle ID, so they are dispatched before the
         // positional argument below is named `bundleID`.
         if ([cmd isEqualToString:@"accounts"]) return logEndSession(cmdAccounts());
+        if ([cmd isEqualToString:@"library"])  return logEndSession(cmdLibrary(pos.count ? pos[0] : nil));
         if (pos.count < 1) { usage(); return logEndSession(64); }
         if ([cmd isEqualToString:@"login"])    return logEndSession(cmdLogin(pos[0], passwordFile, showPassword, allowBootstrap));
         if ([cmd isEqualToString:@"logout"])   return logEndSession(cmdLogout(pos[0], force));
