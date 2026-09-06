@@ -1,8 +1,10 @@
 // appstorectl — buy and install an App Store app from the shell, by bundle ID.
 //
+//   appstorectl purchase  <bundle-id> [--adam <id>]
 //   appstorectl install   <bundle-id> [--adam <id>] [-o <path>] [--evid <id>] [--no-export|--no-decrypt]
 //   appstorectl export    <bundle-id> [-o <path>] [--no-decrypt]
 //   appstorectl resolve   <bundle-id>
+//   appstorectl search    <term> [-l <count>]
 //   appstorectl uninstall <bundle-id>
 //   appstorectl jobs
 //   appstorectl version
@@ -156,6 +158,46 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName, NSNumber 
          bundleID, itemID, attrs[@"name"] ?: @"?",
          price ?: @"?", ios[@"minimumOSVersion"] ?: @"?");
     return itemID;
+}
+
+static int cmdSearch(NSString *term, NSInteger limit) {
+    NSURLComponents *url = [NSURLComponents componentsWithString:@"https://itunes.apple.com/search"];
+    NSMutableArray<NSURLQueryItem *> *query = [@[
+        [NSURLQueryItem queryItemWithName:@"media" value:@"software"],
+        [NSURLQueryItem queryItemWithName:@"entity" value:@"software"],
+        [NSURLQueryItem queryItemWithName:@"term" value:term],
+        [NSURLQueryItem queryItemWithName:@"limit" value:@(limit).stringValue],
+    ] mutableCopy];
+    NSString *cc = activeAccountStorefrontCountryCode() ?: deviceCountryCode();
+    if (cc) [query addObject:[NSURLQueryItem queryItemWithName:@"country" value:cc]];
+    url.queryItems = query;
+
+    NSError *err = nil;
+    NSData *data = [NSData dataWithContentsOfURL:url.URL options:0 error:&err];
+    NSDictionary *payload = data.length
+        ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&err] : nil;
+    NSArray *results = [payload isKindOfClass:NSDictionary.class] ? payload[@"results"] : nil;
+    if (![results isKindOfClass:NSArray.class]) {
+        warnf(@"search failed: %@", err.localizedDescription ?: @"invalid response");
+        return 1;
+    }
+    if (!results.count) {
+        note(@"[=] no App Store results for \"%@\"", term);
+        return 0;
+    }
+
+    NSUInteger index = 0;
+    for (NSDictionary *app in results) {
+        if (![app isKindOfClass:NSDictionary.class]) continue;
+        note(@"[%lu] %@", (unsigned long)++index, app[@"trackName"] ?: @"(unnamed)");
+        note(@"    bundleId: %@", app[@"bundleId"] ?: @"-");
+        note(@"    adamId:   %@", app[@"trackId"] ?: @"-");
+        note(@"    version:  %@", app[@"version"] ?: @"-");
+        note(@"    minOS:    %@", app[@"minimumOsVersion"] ?: @"-");
+        note(@"    price:    %@ %@", app[@"price"] ?: @"-", app[@"currency"] ?: @"");
+    }
+    note(@"[+] %lu result(s)", (unsigned long)index);
+    return 0;
 }
 
 #pragma mark - Observers
@@ -632,10 +674,53 @@ static JobState jobStateFor(NSString *bundleID) {
     return state;
 }
 
+// A full app purchase ignores ASDPurchase.createsJobs=NO (that flag is for IAPs). Cancel the
+// resulting job by its persistentID, which is the same identifier asclient's `jobs cancel` uses.
+static BOOL cancelInstallJobForBundleID(NSString *bundleID) {
+    ASDJobManager *manager = [NSClassFromString(@"ASDJobManager") new];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+
+    while (deadline.timeIntervalSinceNow > 0) {
+        __block NSNumber *jobID = nil;
+        dispatch_semaphore_t listed = dispatch_semaphore_create(0);
+        [manager getJobsUsingBlock:^(void *a0, void *a1, void *a2) {
+            id jobs = (a0 && !((uintptr_t)a0 & 7)) ? (__bridge id)a0 : nil;
+            if ([jobs isKindOfClass:NSArray.class]) {
+                for (ASDJob *job in jobs) {
+                    if ([job.bundleID isEqualToString:bundleID]) {
+                        jobID = @(job.persistentID);
+                        break;
+                    }
+                }
+            }
+            dispatch_semaphore_signal(listed);
+        }];
+        dispatch_semaphore_wait(listed, dispatch_time(DISPATCH_TIME_NOW, 2ull * NSEC_PER_SEC));
+
+        if (jobID) {
+            __block BOOL completed = NO;
+            dispatch_semaphore_t cancelled = dispatch_semaphore_create(0);
+            [manager cancelJobsWithIDs:@[jobID] completionBlock:^{
+                completed = YES;
+                dispatch_semaphore_signal(cancelled);
+            }];
+            dispatch_semaphore_wait(cancelled,
+                                    dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
+            logLine(@"purchase: cancel job %@ completed=%d", jobID, completed);
+            return completed;
+        }
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+    }
+
+    logLine(@"purchase: no install job appeared for %@", bundleID);
+    return YES;
+}
+
 static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL autoAccept,
-                      BOOL autoConfirm, BOOL forceDismiss) {
-    logLine(@"install: begin bundle=%@ adamOverride=%@ accept=%d tryConfirm=%d forceDismiss=%d",
-            bundleID, adamID ?: @"(none)", autoAccept, autoConfirm, forceDismiss);
+                      BOOL autoConfirm, BOOL forceDismiss, BOOL purchaseOnly) {
+    logLine(@"%@: begin bundle=%@ adamOverride=%@ accept=%d tryConfirm=%d forceDismiss=%d",
+            purchaseOnly ? @"purchase" : @"install", bundleID, adamID ?: @"(none)",
+            autoAccept, autoConfirm, forceDismiss);
     // Free-only, and the gate has to be explicit. The buy params below hardcode price=0 and now
     // also assert hasBeenAuthedForBuy / hasConfirmedPaymentSheet, which tell the store the user has
     // already seen and approved a payment sheet. On a free app that is true by construction — there
@@ -659,7 +744,7 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
         }
         knownFree = (price != nil && price.doubleValue == 0.0);
         if (price != nil && !knownFree) {
-            warnf(@"%@ costs %@ — appstorectl installs free apps only", bundleID, price);
+            warnf(@"%@ costs %@ — appstorectl handles free apps only", bundleID, price);
             return 65;
         }
         if (!knownFree)
@@ -668,7 +753,7 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
         note(@"[=] --adam given, so the price is unknown; using the sheet-and-replay path");
     }
 
-    if (isFullyInstalled(installedBundlePath(bundleID))) {
+    if (!purchaseOnly && isFullyInstalled(installedBundlePath(bundleID))) {
         note(@"[=] %@ is already installed", bundleID);
         note(@"[=] version:   %@", installedVersionDescription(bundleID) ?: @"(unknown)");
         return 0;
@@ -699,8 +784,13 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
     // appstored, so a failure here is not fatal — fall back to STDQ, which is what shipped before.
     NSError *libErr = nil;
     LibraryApp *owned = libraryEntryForBundleID(bundleID, &libErr);
-    if (libErr) logLine(@"install: locker lookup failed (%@); assuming not owned",
-                        libErr.localizedDescription);
+    if (libErr) logLine(@"%@: locker lookup failed (%@); assuming not owned",
+                        purchaseOnly ? @"purchase" : @"install", libErr.localizedDescription);
+    if (purchaseOnly && owned) {
+        [center removeProgressObserver:obs];
+        note(@"[=] %@ is already owned by this account", bundleID);
+        return 0;
+    }
     NSString *pricing = owned ? @"STDRDL" : @"STDQ";
     if (owned) note(@"[=] already in this account's library; redownloading");
 
@@ -720,7 +810,7 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
         p.buyParameters = [p.buyParameters stringByAppendingFormat:@"&appExtVrsId=%@", evid];
         note(@"[+] pinning external version id %@", evid);
     }
-    p.createsJobs   = YES;
+    p.createsJobs   = !purchaseOnly;
     p.clientID      = @"com.apple.AppStore";
     // Mandatory and easy to miss: purchaseID defaults to 0, and a job with purchaseID 0 is never
     // correlated to its purchase, so appstored parks it at phase 9 forever with no error at all.
@@ -918,6 +1008,19 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
 
     disarm();   // the sheet is behind us either way; do not leave the tweak armed
     if (!ok) return 1;
+    if (purchaseOnly) {
+        [center removeProgressObserver:obs];
+        if (!cancelInstallJobForBundleID(bundleID)) {
+            warnf(@"license acquired, but the install job could not be canceled");
+            return 6;
+        }
+        if (isFullyInstalled(installedBundlePath(bundleID))) {
+            warnf(@"license acquired, but %@ finished installing before cancellation", bundleID);
+            return 6;
+        }
+        note(@"[+] license acquired; install canceled");
+        return 0;
+    }
     note(@"[+] purchased, waiting for install");
 
     // Poll disk for completion; progress lines arrive asynchronously from the observer meanwhile.
@@ -1034,9 +1137,11 @@ static void usage(void) {
     fprintf(stderr,
         "appstorectl — install and export free App Store apps from the shell\n\n"
         "Commands:\n"
+        "  appstorectl purchase  <bundle-id> [--adam <id>]\n"
         "  appstorectl install   <bundle-id> [--adam <id>] [--evid <id>] [-o <path>]\n"
         "  appstorectl export    <bundle-id> [-o <path>]\n"
         "  appstorectl resolve   <bundle-id>\n"
+        "  appstorectl search    <term> [-l <count>]\n"
         "  appstorectl versions  <bundle-id>\n"
         "  appstorectl library   [<bundle-id>]\n"
         "  appstorectl storefront [<id>]\n"
@@ -1112,6 +1217,7 @@ int main(int argc, char **argv) {
         NSNumber *evid = nil;
         NSString *paramsOverride = nil;
         long long purchaseType = 0;
+        NSInteger searchLimit = 5;
 
         for (int i = 2; i < argc; i++) {
             NSString *a = @(argv[i]);
@@ -1155,6 +1261,10 @@ int main(int argc, char **argv) {
                 evid = @(atoll(argv[++i]));
                 continue;
             }
+            if ([a isEqualToString:@"--limit"] || [a isEqualToString:@"-l"]) {
+                searchLimit = ++i < argc ? atol(argv[i]) : 0;
+                continue;
+            }
             [pos addObject:a];
         }
 
@@ -1167,6 +1277,13 @@ int main(int argc, char **argv) {
         if ([cmd isEqualToString:@"accounts"]) return logEndSession(cmdAccounts());
         if ([cmd isEqualToString:@"storefront"]) return logEndSession(cmdStorefront(pos.count ? pos[0] : nil));
         if ([cmd isEqualToString:@"library"])  return logEndSession(cmdLibrary(pos.count ? pos[0] : nil));
+        if ([cmd isEqualToString:@"search"]) {
+            if (!pos.count || searchLimit < 1 || searchLimit > 200) {
+                warnf(@"usage: appstorectl search <term> [-l 1..200]");
+                return logEndSession(64);
+            }
+            return logEndSession(cmdSearch([pos componentsJoinedByString:@" "], searchLimit));
+        }
         if (pos.count < 1) { usage(); return logEndSession(64); }
         if ([cmd isEqualToString:@"login"])    return logEndSession(cmdLogin(pos[0], passwordFile, showPassword, allowBootstrap));
         if ([cmd isEqualToString:@"logout"])   return logEndSession(cmdLogout(pos[0], force));
@@ -1188,13 +1305,23 @@ int main(int argc, char **argv) {
         if ([cmd isEqualToString:@"versions"])  return logEndSession(cmdVersions(bundleID, paramsOverride, purchaseType));
         if ([cmd isEqualToString:@"uninstall"]) return logEndSession(cmdUninstall(bundleID));
         if ([cmd isEqualToString:@"export"])    return logEndSession(cmdExport(bundleID, exportPath, decryptExport));
+        if ([cmd isEqualToString:@"purchase"]) {
+            if (evid) {
+                warnf(@"--evid is only valid with install");
+                return logEndSession(64);
+            }
+            if (!skipPreflight) biometricPreflight();
+            return logEndSession(cmdInstall(bundleID, adamOverride, nil, autoAccept, autoConfirm,
+                                            forceDismiss, YES));
+        }
         if ([cmd isEqualToString:@"install"]) {
             // Before spending a purchase: if the account is opted into a biometric this device
             // cannot perform, the store will demand a password no dismissal can answer. Clearing
             // that is the difference between a hands-off install and a dead end.
             if (!skipPreflight) biometricPreflight();
 
-            int rc = cmdInstall(bundleID, adamOverride, evid, autoAccept, autoConfirm, forceDismiss);
+            int rc = cmdInstall(bundleID, adamOverride, evid, autoAccept, autoConfirm, forceDismiss,
+                                NO);
             // Only package what actually installed — exporting after a failed install would either
             // error confusingly or silently archive a stale copy from an earlier run.
             if (rc != 0 || !alsoExport) return logEndSession(rc);

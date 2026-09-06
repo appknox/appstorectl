@@ -146,6 +146,11 @@
 - (void)cancelJobsWithIDs:(id)ids completionBlock:(id)block;
 @end
 
+@interface ASDJob : NSObject
+@property (readonly) NSString *bundleID;
+@property (readonly) long long persistentID;
+@end
+
 
 #pragma mark - StoreServices.framework
 

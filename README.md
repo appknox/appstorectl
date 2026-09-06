@@ -71,9 +71,11 @@ ssh root@<device-ip> 'dpkg -r com.appknox.appstorectl'
 ## Usage
 
 ```sh
+appstorectl purchase  <bundle-id> [--adam <id>]
 appstorectl install   <bundle-id> [--adam <id>] [--evid <id>] [-o <path>] [-q]
 appstorectl export    <bundle-id> [-o <path>]
 appstorectl resolve   <bundle-id>
+appstorectl search    <term> [-l <count>]
 appstorectl versions  <bundle-id>
 appstorectl library   [<bundle-id>]
 appstorectl uninstall <bundle-id>
@@ -89,6 +91,9 @@ authpref [free|paid] [always|sometimes|never]
 
 `install` purchases a free app, waits for installation, exports it, and decrypts the export. Use these options to narrow that default flow:
 
+`purchase` acquires a free app license for the signed-in account and cancels the download before
+installation.
+
 | Option | Effect |
 |---|---|
 | `--no-export` | Install without creating an IPA. |
@@ -102,6 +107,11 @@ authpref [free|paid] [always|sometimes|never]
 | `-q` | Print only errors. Persistent logging remains enabled. |
 
 `install` handles free apps only, and now says so before contacting the store: a paid bundle id exits 65 with its price, rather than attempting a purchase that would fail later.
+
+`search` queries the public iTunes Search API for iOS apps and prints each match's name, bundle ID,
+adamId, version, minimum iOS and price. It returns five results by default; use `-l` to change the
+limit. Search follows the active account's storefront, falling back to the device region when it
+cannot map that storefront.
 
 `library` lists what the signed-in Apple ID owns, which is not the same as what is installed — an app can be owned and absent. `install` uses it to ask the store for a redownload rather than a purchase when the app is already in the locker.
 

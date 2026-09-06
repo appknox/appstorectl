@@ -84,6 +84,16 @@ static const struct { int front; const char *cc; } kStoreFronts[] = {
     {143491,"IL"}, {143492,"UA"}, {143493,"KW"}, {143498,"QA"}, {143559,"BH"},
 };
 
+NSString *activeAccountStorefrontCountryCode(void) {
+    for (SSAccount *account in liveAccounts()) {
+        if (!account.isActive) continue;
+        int front = account.storeFrontIdentifier.intValue;
+        for (size_t i = 0; i < sizeof(kStoreFronts) / sizeof(kStoreFronts[0]); i++)
+            if (kStoreFronts[i].front == front) return @(kStoreFronts[i].cc);
+    }
+    return nil;
+}
+
 // "143467-2,29" -> "143467-2,29 (IN)". intValue stops at the first non-digit, which is the '-'.
 static NSString *storeFrontLabel(NSString *sf) {
     if (!sf.length) return @"-";

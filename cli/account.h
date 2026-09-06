@@ -70,6 +70,9 @@ SSAccount *waitForAccount(NSString *appleID, BOOL wantPresent, NSTimeInterval ti
 
 void printAccountTable(NSString *heading);
 
+/// Two-letter country code for the active store account's storefront, or nil if unmapped.
+NSString *activeAccountStorefrontCountryCode(void);
+
 /// Print an NSError and its whole underlying chain. A bare domain and code is the least useful part
 /// of a store failure; the server payload lives in userInfo.
 void printErrorChain(NSError *e, int depth);
