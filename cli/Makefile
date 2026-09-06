@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = appstorectl authpref
 
-APPSTORECTL_VERSION = 1.0.0
+APPSTORECTL_VERSION = 1.1.0
 
 # The service gate is a single entitlement: com.apple.itunesstored.private. Without it every call
 # into appstored returns ASDErrorDomain 505 "Not entitled for this service."
