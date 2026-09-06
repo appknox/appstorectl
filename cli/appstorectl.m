@@ -196,7 +196,9 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName, NSNumber 
     note(@"[dialog] %@ — %@", request.identifier ?: @"(no identifier)", request.message ?: @"(no message)");
 
     if (!handler) return;
-    if (!self.autoAccept || !chosen) {
+    BOOL isCompatibleVersionOffer =
+        [request.identifier isEqualToString:@"MZCommerce.OsRequiresEarlierAppVersion"];
+    if ((!self.autoAccept && !isCompatibleVersionOffer) || !chosen) {
         // Declining is a legitimate answer: a nil result is what the observer returns when it
         // will not act, and the store then falls back to the replay path.
         note(@"[dialog] not answering (%@)", chosen ? @"--accept not set" : @"no button actions");
@@ -848,8 +850,17 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
                             storeDialogKind(err) ?: @"(none)",
                             retryParams.length ? @"yes" : @"no");
                     if (!retryParams) {
-                        note(@"[-] purchase failed");
-                        describeError(err);
+                        NSDictionary *payload = err.userInfo[@"AMSServerPayload"];
+                        NSString *dialogID = payload[@"metrics"][@"dialogId"];
+                        if ([dialogID isEqualToString:@"MZCommerce.ProductRequiresLaterStoreVersion"]) {
+                            note(@"[-] %@", payload[@"customerMessage"] ?: @"This app requires a newer iOS version.");
+                            note(owned
+                                ? @"    Apple did not offer a compatible older build for this device."
+                                : @"    Acquire it once on a compatible device, then retry here.");
+                        } else {
+                            note(@"[-] purchase failed");
+                            describeError(err);
+                        }
                     }
                 } else {
                     logLine(@"purchaseID %lld succeeded", pid);
@@ -1022,6 +1033,7 @@ static int cmdJobs(void) {
 static void usage(void) {
     fprintf(stderr,
         "appstorectl — install and export free App Store apps from the shell\n\n"
+        "Commands:\n"
         "  appstorectl install   <bundle-id> [--adam <id>] [--evid <id>] [-o <path>]\n"
         "  appstorectl export    <bundle-id> [-o <path>]\n"
         "  appstorectl resolve   <bundle-id>\n"
@@ -1031,34 +1043,20 @@ static void usage(void) {
         "  appstorectl uninstall <bundle-id>\n"
         "  appstorectl jobs\n"
         "  appstorectl version\n\n"
+        "Account commands:\n"
         "  appstorectl accounts\n"
         "  appstorectl login    <apple-id> [--password-file <path>] [--show-password] [--no-bootstrap]\n"
         "  appstorectl logout   <apple-id> [--force]\n\n"
-        "  login reads the password from --password-file, then $APPSTORECTL_PASSWORD, then a\n"
-        "  terminal prompt. Never pass it on the command line; ps would show it.\n"
-        "  --show-password echoes what you type, to check it is being read correctly.\n"
-        "  The first login for an Apple ID on a device needs a verification code typed once;\n"
-        "  login asks for it automatically. --no-bootstrap fails instead, for unattended use.\n"
-        "  logout is the only way to remove an account: Settings lists only the active one.\n\n"
-        "  install exports and decrypts by default. It no longer arms the tweak: the buy params\n"
-        "  it sends stop the store raising a confirmation sheet at all.\n"
-        "  Decryption launches the app on the device, so a run is slower than a bare install.\n"
-        "  --no-export     install only; do not package an IPA\n"
-        "  --no-decrypt    package an encrypted IPA (cryptid 1) instead\n"
-        "  --force-dismiss arm the AutoConfirmSheet tweak; only needed if a sheet still appears\n"
-        "  --no-preflight  skip the biometric pre-flight (see docs/GATES.md gate 2)\n"
-        "  -o <path>    export destination (default /var/jb/tmp/appstorectl-exports/)\n"
-        "  --adam <id>  skip store lookup and use this adamId\n"
-        "  --evid <id>  install a specific build; `versions` lists what the store will serve\n"
-        "  --accept       auto-answer store dialogs affirmatively\n"
-        "  --export, --decrypt are accepted and redundant; they are the defaults\n"
-        "  --no-dismiss is accepted and redundant; not arming the tweak is now the default\n"
-        "  --try-confirm  attempt to answer the confirmation sheet (does not currently work)\n"
-        "\n"
-        "The store shows a confirmation sheet for the first purchase. Dismiss it (tapping\n"
-        "anywhere outside is enough); the confirmedPaymentUUID is then replayed automatically\n"
-        "and the install completes without further interaction.\n"
-        "  -q           only print errors\n");
+        "Install options:\n"
+        "  --no-export       install only; do not create an IPA\n"
+        "  --no-decrypt      export an encrypted IPA (cryptid 1)\n"
+        "  --no-preflight    skip the biometric-state check\n"
+        "  --adam <id>       skip lookup and use this adamId\n"
+        "  --evid <id>       install a specific build\n"
+        "  --accept          affirmatively answer other store dialogs\n"
+        "  --try-confirm     try the legacy confirmation-sheet answer\n"
+        "  -o <path>         export destination\n"
+        "  -q                print only errors\n");
 }
 
 int main(int argc, char **argv) {

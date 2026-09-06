@@ -97,6 +97,7 @@ authpref [free|paid] [always|sometimes|never]
 | `--no-preflight` | Skip the biometric-state preflight. |
 | `--adam <id>` | Skip metadata lookup and use this `adamId`. Also skips the price check, so the sheet-suppressing buy params are withheld and the sheet may appear. |
 | `--evid <id>` | Install a specific build instead of the current one. `versions` prints the current build's id. |
+| `--accept` | Answer store dialogs affirmatively. The last-compatible-version dialog is handled automatically without this flag. |
 | `-o <path>` | Set the export path. The default directory is `/var/jb/tmp/appstorectl-exports/`. |
 | `-q` | Print only errors. Persistent logging remains enabled. |
 
@@ -104,7 +105,12 @@ authpref [free|paid] [always|sometimes|never]
 
 `library` lists what the signed-in Apple ID owns, which is not the same as what is installed — an app can be owned and absent. `install` uses it to ask the store for a redownload rather than a purchase when the app is already in the locker.
 
-`versions` prints the build the store would serve right now and its minimum iOS, which is what a plain `install` will get. It cannot list older builds: that list exists only inside a completed purchase response and the store will not complete one for this process. If you have a build id from elsewhere, `--evid` installs it.
+`versions` prints the current catalog build and its minimum iOS. If an app already belongs to the
+account and its current build is too new for the device, `install` accepts Apple's
+last-compatible-version offer and installs the server-selected older build automatically. An
+unowned app must first be acquired on a compatible device. appstorectl does not guess from the
+EVID list. `versions` still cannot enumerate that list; if you already have an EVID from elsewhere,
+`--evid` installs it directly.
 
 `login` reads the password from `--password-file`, then `APPSTORECTL_PASSWORD`, then a terminal prompt. Do not pass a password directly on the command line. `--show-password` echoes terminal input, and `--no-bootstrap` fails instead of requesting the first-login verification code. `logout --force` permits removal of the active account. Account behavior is documented in [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
