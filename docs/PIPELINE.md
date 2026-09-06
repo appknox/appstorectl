@@ -124,14 +124,44 @@ Nothing on the device validates it. `-[AMSBuyParams _parseBuyParams:]` (`0x1842f
 `NSURLComponents`, sets the string as `percentEncodedQuery` and walks `queryItems` into a
 dictionary. No schema, no required keys, no error path. Every constraint is server-side.
 
-Four keys are enough in practice:
+Four keys are enough to be accepted:
 
 ```
 salableAdamId=<id>&productType=C&price=0&pricingParameters=STDQ
 ```
 
+but four keys also gets you a confirmation sheet. What `cmdInstall` sends now:
+
+```
+salableAdamId=<id>&productType=C&price=0&pricingParameters=<STDQ|STDRDL>
+  &hasBeenAuthedForBuy=true&hasConfirmedPaymentSheet=true
+  [&appExtVrsId=<evid>]
+```
+
+| addition | why |
+|---|---|
+| `hasBeenAuthedForBuy` + `hasConfirmedPaymentSheet` | the store stops raising the confirmation sheet. Apple's own asclient sends both for a free or owned app, `-[Installer _purchaseApp:]` `0x100111db0`. Free apps only — see docs/GATES.md gate 3 |
+| `STDRDL` instead of `STDQ` | when the app is already in the account's locker, which `appstorectl library` answers. asclient branches the same way, and appstored's own cached `redownload-params` for an installed app read `STDRDL` |
+| `appExtVrsId` | `--evid`. Pins a specific build. The DSID-less spelling is `externalVersionId`, and asclient uses that one only when installing DSID-less, which we never are |
+
 `pricingParameters` values present in this firmware: `STDQ` (standard purchase), `STDRDL` (standard
-redownload), `GAME` / `GAMEPRE` (Arcade), `STDQPRE` (pre-order).
+redownload), `SWUPD` (update), `GAME` / `GAMEPRE` (Arcade), `STDQPRE` (pre-order).
+
+### The store's own string, for comparison
+
+The catalog will hand you the exact buy params it would use, via `AMSMediaTask` — see
+`cli/store/versions.m`. For `com.google.Authenticator`:
+
+```
+productType=C&price=0&salableAdamId=388497605&pricingParameters=STDQ&pg=default&appExtVrsId=890205999
+productType=C&price=0&salableAdamId=388497605&pricingParameters=SWUPD&pg=default&appExtVrsId=890205999
+```
+
+Two keys ours does not carry: `pg=default` (parental guidance) and `appExtVrsId` pinned to the
+current build. Neither has proved necessary on the appstored path.
+
+`ASDPurchaseHistoryApp.redownloadParams` is a third source — a store-issued string cached by
+appstored, reachable with no store request at all. Not used yet.
 
 Key spellings, resolved from the `AMSBuyParamProperty*` constants appstored links:
 
@@ -147,6 +177,7 @@ Key spellings, resolved from the `AMSBuyParamProperty*` constants appstored link
 | `ExternalVersionId` | `externalVersionId` |
 | `ExistingExternalVersionId` | `existingExternalVersionId` |
 | `HasBeenAuthedForBuy` | `hasBeenAuthedForBuy` |
+| `HasConfirmedPaymentSheet` | `hasConfirmedPaymentSheet` |
 | `InstalledSoftwareRating` | `installedSoftwareRating` |
 | `IsBackground` | `is-background` |
 | `RequestType` | `requestType` |

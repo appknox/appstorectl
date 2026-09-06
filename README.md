@@ -18,8 +18,9 @@ Verified on iOS 15.8.1 (19H380) and iOS 16.7.12 (20H364). Other iOS 15 and 16 re
 ```console
 $ appstorectl install com.netflix.Speedtest
 [+] com.netflix.Speedtest  ->  adamId 1133348139   (FAST Speed Test, 0 USD, minOS 7.0)
-[+] force-dismiss armed (AutoConfirmSheet tweak will dismiss the sheet)
+[=] already in this account's library; redownloading
 [+] purchasing com.netflix.Speedtest (adamId 1133348139)
+    attempt with purchaseID 2010468
 [+] purchased, waiting for install
 [+] installed: /var/containers/Bundle/Application/BA34E858-47C5-4731-8EC8-7D2D1161BA40/FAST.app
 [+] decrypt     1 encrypted image(s)
@@ -70,9 +71,11 @@ ssh root@<device-ip> 'dpkg -r com.appknox.appstorectl'
 ## Usage
 
 ```sh
-appstorectl install   <bundle-id> [--adam <id>] [-o <path>] [-q]
+appstorectl install   <bundle-id> [--adam <id>] [--evid <id>] [-o <path>] [-q]
 appstorectl export    <bundle-id> [-o <path>]
 appstorectl resolve   <bundle-id>
+appstorectl versions  <bundle-id>
+appstorectl library   [<bundle-id>]
 appstorectl uninstall <bundle-id>
 appstorectl jobs
 appstorectl version
@@ -90,11 +93,18 @@ authpref [free|paid] [always|sometimes|never]
 |---|---|
 | `--no-export` | Install without creating an IPA. |
 | `--no-decrypt` | Keep exported images FairPlay-encrypted at `cryptid 1`. |
-| `--no-dismiss` | Do not arm AutoConfirmSheet; dismiss the confirmation sheet manually. |
+| `--force-dismiss` | Arm AutoConfirmSheet. Off by default; only needed if a confirmation sheet still appears. See [docs/GATES.md](docs/GATES.md) gate 3. |
 | `--no-preflight` | Skip the biometric-state preflight. |
-| `--adam <id>` | Skip metadata lookup and use this `adamId`. |
+| `--adam <id>` | Skip metadata lookup and use this `adamId`. Also skips the price check, so the sheet-suppressing buy params are withheld and the sheet may appear. |
+| `--evid <id>` | Install a specific build instead of the current one. `versions` prints the current build's id. |
 | `-o <path>` | Set the export path. The default directory is `/var/jb/tmp/appstorectl-exports/`. |
 | `-q` | Print only errors. Persistent logging remains enabled. |
+
+`install` handles free apps only, and now says so before contacting the store: a paid bundle id exits 65 with its price, rather than attempting a purchase that would fail later.
+
+`library` lists what the signed-in Apple ID owns, which is not the same as what is installed — an app can be owned and absent. `install` uses it to ask the store for a redownload rather than a purchase when the app is already in the locker.
+
+`versions` prints the build the store would serve right now and its minimum iOS, which is what a plain `install` will get. It cannot list older builds: that list exists only inside a completed purchase response and the store will not complete one for this process. If you have a build id from elsewhere, `--evid` installs it.
 
 `login` reads the password from `--password-file`, then `APPSTORECTL_PASSWORD`, then a terminal prompt. Do not pass a password directly on the command line. `--show-password` echoes terminal input, and `--no-bootstrap` fails instead of requesting the first-login verification code. `logout --force` permits removal of the active account. Account behavior is documented in [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
@@ -133,9 +143,11 @@ Three independent conditions can require interaction:
 
 1. The Apple ID password policy for free downloads. `authpref free never` can change it, but this is an optimization rather than an installation prerequisite.
 2. Biometric purchase authorization. The preflight only clears an enabled state that has no valid enrolled identity. It leaves a working Face ID or Touch ID configuration alone.
-3. The ordinary purchase confirmation sheet. AutoConfirmSheet dismisses this sheet; it never approves or authorizes a payment.
+3. The ordinary purchase confirmation sheet. **No longer raised for a free app.** The purchase now carries `hasBeenAuthedForBuy` and `hasConfirmedPaymentSheet`, which is what Apple's own internal App Store CLI sends for a free or already-owned app, and the store does not ask.
 
-`--force-dismiss`, enabled by default, creates `/var/jb/tmp/.autoconfirm`. The tweak accepts a flag for at most five minutes and consumes it when the first matching sheet appears. It acts only inside PassbookUIService and only on `PKPaymentAuthorizationRemoteAlertViewController`. The CLI removes the flag when the purchase call ends normally.
+Because nothing asks, nothing needs dismissing. `--force-dismiss` is **off by default**. It still exists, and AutoConfirmSheet still ships, for the cases the buy params do not cover: `--adam` withholds them, and Ask to Buy and required-biometric accounts are untested against the new path.
+
+When armed, `--force-dismiss` creates `/var/jb/tmp/.autoconfirm`. The tweak accepts a flag for at most five minutes and consumes it when the first matching sheet appears. It acts only inside PassbookUIService and only on `PKPaymentAuthorizationRemoteAlertViewController`, and it dismisses — it never approves or authorizes a payment. The CLI removes the flag when the purchase call ends normally.
 
 See [docs/GATES.md](docs/GATES.md) when an install still requests a password or biometric approval.
 

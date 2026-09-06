@@ -3,8 +3,31 @@
 appstorectl is a Theos aggregate project with three components:
 
 - `cli/`: purchase, account, install, export, and logging commands
+- `cli/store/`: everything that talks to the store's own frameworks rather than to appstored
 - `decrypt/`: separately entitled helper for reading decrypted process memory
-- `tweak/`: AutoConfirmSheet injection for PassbookUIService
+- `tweak/`: AutoConfirmSheet injection for PassbookUIService, no longer on the default install path
+
+`cli/store/` exists so that private-framework surface stays in one place instead of accreting in
+`appstorectl.m`:
+
+| file | what |
+|---|---|
+| `AMSPrivate.h` | AppleMediaServices interfaces: the dialog objects, the purchase queue, the media task, the bag, the keybag. Every block signature is annotated with the type encoding it was read from |
+| `versions.{h,m}` | the catalog metadata lookup, and the version-list attempt that the store refuses |
+| `library.{h,m}` | what the active account owns, via `ASDPurchaseHistory` |
+| `buyparams.{h,m}` | pulling `okButtonAction.buyParams` out of a store refusal |
+
+**Never guess a private block signature.** Declaring one wrong is a SIGBUS inside `objc_retain`,
+not an error you can catch, because ARC retains whatever happened to be in the argument register.
+Two of the four in `cli/store/` would have been wrong if guessed, and one was, and cost a crash.
+Read them out of the protocol method-type tables in the framework binary instead:
+
+```sh
+strings -a AppStoreDaemon | grep -E 'v[0-9]+@0:8.*@\?<'
+```
+
+The encoding inlines the block's own signature between the angle brackets. `ASDPrivate.h` has the
+longer version of this warning.
 
 The decrypt helper must remain separate from the CLI. It needs `task_for_pid-allow`,
 `com.apple.private.cs.debugger`, and `no-sandbox`; the store client does not need those
@@ -82,6 +105,11 @@ Important decrypt constraints:
   a newer minimum OS have still yielded plaintext on older tested devices.
 
 ## AutoConfirmSheet
+
+Off the default path since 2026-08-29: the buy params stop the store raising a sheet, so
+`--force-dismiss` defaults to off and no flag is created. It is kept as the fallback for `--adam`
+and for account states the buy params have not been tested against. Everything below still applies
+whenever it is armed.
 
 The tweak may dismiss the purchase-confirmation controller; it must never confirm or authorize a
 payment. Keep all three gates:

@@ -4,11 +4,16 @@ Getting to a hands-off install means clearing three independent mechanisms. They
 separate: clearing one produces **no visible change** until the others are cleared too, which makes
 this confusing to debug from the outside.
 
+> **Gate 3 is now cleared differently, and gate 1 turned out not to be a prerequisite.** Two buy
+> params stop the confirmation sheet being raised at all, so the AutoConfirmSheet tweak is no longer
+> on the normal path and `--force-dismiss` defaults to off. The gate-by-gate reasoning below is kept
+> because it is still what the mechanisms *are*, and because the fallback path still uses all of it.
+
 | # | Gate | Where it lives | Clear it with |
 |---|---|---|---|
 | 1 | Password for free downloads | Apple ID account setting, server-synced | `authpref free never`, **or nothing at all**, see below |
 | 2 | Biometric signature | device — `BiometricState` | Settings → Touch ID & Passcode → iTunes & App Store off |
-| 3 | Confirmation sheet | PassbookUIService, PassKit remote alert | `--force-dismiss` + AutoConfirmSheet |
+| 3 | Confirmation sheet | PassbookUIService, PassKit remote alert | two buy params, so it is never raised. `--force-dismiss` + AutoConfirmSheet is now only a fallback |
 
 ## Gate 1 — the account password setting
 
@@ -99,8 +104,24 @@ $ appstorectl install com.netflix.Speedtest --force-dismiss --export
 Three attempts, two replays. A fresh `purchaseID` per attempt is required, otherwise the store
 dedupes the retry onto the first one.
 
-The `[dialog] replied nil` line confirms that the result handler ran without the former
-`KERN_INVALID_ADDRESS at 0x1` failure.
+That log is from `2026-08-27` and is kept because it is the clearest picture of the multi-round
+behaviour. It is no longer what a run looks like. With the two buy params from gate 3 the same
+install is one attempt, no dialog, no replay:
+
+```console
+$ appstorectl install com.netflix.Speedtest --accept --no-export
+[+] com.netflix.Speedtest  ->  adamId 1133348139   (FAST Speed Test, 0 USD, minOS 7.0)
+[=] already in this account's library; redownloading
+[+] purchasing com.netflix.Speedtest (adamId 1133348139)
+    attempt with purchaseID 2010468
+[+] purchased, waiting for install
+[+] installed
+```
+
+In the historical log above, the `[dialog] replied nil` line confirmed that the result handler ran
+without the former `KERN_INVALID_ADDRESS at 0x1` failure. Replying nil was the safe thing to do at
+the time, but it was not the only thing possible — the handler takes an `AMSDialogResult`, and the
+observer now answers with one. The correction is in the gate 3 section below.
 
 On this account, `authpref` cannot run:
 `UpdateAccountPasswordSettingsOperation` requires a secure token the account does not hold, and the
@@ -145,7 +166,47 @@ With gates 1 and 2 cleared, the Touch ID prompt is replaced by a plain confirmat
 
 ## Gate 3 — the confirmation sheet
 
-This one has no client-side switch at all.
+**Superseded, 2026-08-29. The sheet is no longer raised, so there is nothing to dismiss.** The rest
+of this section is why that took so long to find, and it is still accurate about the sheet itself —
+which matters, because the fallback still depends on it.
+
+### The two params
+
+Apple's own internal CLI sets these on the **first** attempt whenever the app is free or already
+owned, before the store has raised anything — `-[Installer _purchaseApp:]` in
+`/usr/local/bin/asclient` (`0x100111db0`, iOS 16.0 beta AppleInternal rootfs):
+
+```objc
+if (!dsidLess && (app.price == 0.0 || app.owned)) {
+    bp[AMSBuyParamPropertyHasBeenAuthedForBuy]      = @"true";
+    bp[AMSBuyParamPropertyHasConfirmedPaymentSheet] = @"true";
+}
+```
+
+appstorectl only ever saw these two coming *back*, inside a rejection's `okButtonAction.buyParams`
+(see "Dismissing is sufficient" below). Sending them outbound stops the store asking at all.
+
+Measured on iPhone10,3 / 16.7.12 / 20H364 with `AutoConfirmSheet.dylib` **moved out of**
+`/var/jb/Library/MobileSubstrate/DynamicLibraries/` and PassbookUIService restarted:
+
+| buy params | app | attempts | dialog | outcome |
+|---|---|---|---|---|
+| without the two | `com.netflix.Speedtest` | 1, then hangs | none | **hung on the sheet**, killed |
+| with the two | `com.netflix.Speedtest` (owned) | 1 | none | installed |
+| with the two | `com.google.Authenticator` (never owned) | 1 | none | installed |
+| with the two | `org.videolan.vlc-ios`, `com.ookla.speedtest`, `com.hammerandchisel.discord` | 1 each | none | installed |
+
+The tweak's own trace log at `/var/jb/tmp/autoconfirm.log` has no entry from any of those runs,
+which is the independent check: it did not act, because it was not installed and nothing asked it to.
+
+Caveats. Only **free** apps, which is all appstorectl installs, and asclient guards the same two
+params behind `price == 0 || owned` for a reason — `cmdInstall` now refuses a paid app outright
+rather than lie about a confirmed sheet. Only tested on an account whose
+`freeDownloadsPasswordSetting` has settled to `never`. Not tested against Ask to Buy or a device
+that requires a biometric signature.
+
+`--force-dismiss` therefore defaults to **off**. The tweak still ships, because `--adam` withholds
+the two params and the account states above are unmapped.
 
 ### It is not answerable through appstored
 
@@ -175,9 +236,39 @@ Things that consequently do not work:
 
 | attempt | result |
 |---|---|
-| `setDialogObserver:` + auto-accept | observer never called |
+| `setDialogObserver:` + auto-accept | observer never called **for this sheet** — see the correction below |
 | `notifyDialogCompleteForPurchaseID:result:selectedButton:` | accepted, no error, **no-op** — it completes dialogs delivered to a client, and AMS registered none |
 | suppressing it via `ASDPurchase` | no field maps to `PurchaseInfo.suppressDialogs`; `skipsConfirmationDialogs` is never set from client input |
+
+> **Correction to the first row.** The observer is never called for the payment sheet, which is what
+> that row was about and is still true. But an earlier version of this document, and the comment in
+> `cli/appstorectl.m` it came from, went further and said a dialog delivered to the observer *could
+> not be answered affirmatively at all*. That was wrong.
+>
+> The result handler is `void (^)(AMSDialogResult *, NSError *)`. That is not inferred — it is the
+> inlined block signature from `__OBJC_$_PROTOCOL_METHOD_TYPES_ASDNotificationCenterDialogObserver`
+> in AppStoreDaemon:
+>
+> ```
+> v32@0:8@"AMSDialogRequest"16@?<v@?@"AMSDialogResult"@"NSError">24
+> ```
+>
+> The old code declared it `^(BOOL, id)` and called `blk(YES, nil)`, which put the literal `0x1`
+> where an object pointer belongs; NSXPC then ran `objc_opt_isKindOfClass` on `0x1` and the process
+> died. The crash was a wrong declaration, not an unanswerable callee.
+>
+> Confirmed at runtime: installing an app that needs a newer iOS delivers
+> `MZCommerce.ProductRequiresLaterStoreVersion` to the observer with a populated `defaultAction`, and
+> answering with a constructed `AMSDialogResult` returns cleanly. It does not change *that* outcome —
+> the dialog has one OK button — but the channel works. See
+> `../../asclient-re/DELTAS-FOR-APPSTORECTL.md` §1.
+>
+> So there are two dialog channels, and only one reaches the observer:
+>
+> | channel | who raises it | what appstorectl sees |
+> |---|---|---|
+> | purchase-response dialog | AMS → PassKit → PassbookUIService, out of process | `NSError` with `userInfo[@"AMSServerPayload"][@"dialog"]`, and a sheet on screen |
+> | `ASDNotificationCenter` observer | appstored → client, in process | `handleDialogRequest:resultHandler:` |
 
 ### Who actually draws it
 

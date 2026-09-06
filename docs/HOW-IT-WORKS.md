@@ -36,25 +36,52 @@ What the evidence does support, and what actually matters for the rest of this: 
 
 ## One install, start to finish
 
-Here is the real sequence for `appstorectl install <bundle-id> --force-dismiss`. Everything later in this document is a detail hanging off one of these steps, so it is worth having the map first.
+Here is the real sequence for `appstorectl install <bundle-id>`. Everything later in this document is a detail hanging off one of these steps, so it is worth having the map first.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as you
     participant C as appstorectl
-    participant W as AutoConfirmSheet<br/>(in PassbookUIService)
     participant A as appstored
     participant S as store server
     participant I as installd
 
-    U->>C: install com.example.app --force-dismiss
+    U->>C: install com.example.app
     C->>C: biometricPreflight()
     C->>S: GET itunes.apple.com/lookup?bundleId=...
     S-->>C: adamId, price, minOS
-    C->>C: create fresh /var/jb/tmp/.autoconfirm
+    C->>C: refuse here if the app is not free
+    C->>A: ASDPurchaseHistory: is it already in the locker?
+    A-->>C: yes / no, so STDRDL or STDQ
     C->>A: getPurchaseServiceWithError:
     A-->>C: XPC proxy (hold this)
+    C->>A: startPurchase: (ASDPurchase, sheet pre-confirmed)
+    A->>S: buyProduct
+    S-->>A: download IDs + SINF
+    A->>I: stage, validate, install
+    C->>C: poll disk until SC_Info/*.sinf exists
+    C-->>U: installed, version, path
+```
+
+One round trip, no sheet, no replay. That is a change from what this document used to describe, and it is worth being precise about what moved.
+
+**Until 2026-08-29** the purchase carried four buy params, the store answered with a confirmation sheet, PassbookUIService drew it, AutoConfirmSheet dismissed it, and appstorectl replayed the `okButtonAction.buyParams` the rejection carried. Two to three attempts per install.
+
+**Now** the purchase carries `hasBeenAuthedForBuy=true` and `hasConfirmedPaymentSheet=true` — what Apple's own internal App Store CLI sends for a free or owned app — and the store does not ask. See [GATES.md](GATES.md) gate 3 for the measurements.
+
+The old path is still in the code and still reachable, because the new one does not cover everything:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as appstorectl
+    participant W as AutoConfirmSheet<br/>(in PassbookUIService)
+    participant A as appstored
+    participant S as store server
+
+    Note over C: --adam, or an account state the buy params do not cover
+    C->>C: create fresh /var/jb/tmp/.autoconfirm
     C->>A: startPurchase: (ASDPurchase)
     A->>S: buyProduct
     S-->>A: dialog + replay params
@@ -65,9 +92,6 @@ sequenceDiagram
     C->>A: startPurchase: (replay)
     A->>S: buyProduct + confirmedPaymentUUID
     S-->>A: download IDs + SINF
-    A->>I: stage, validate, install
-    C->>C: poll disk until SC_Info/*.sinf exists
-    C-->>U: installed, version, path
 ```
 
 Most of that is unremarkable. Four steps are not, and each has a detail the diagram cannot show.
@@ -86,13 +110,15 @@ It is a public endpoint, unauthenticated, read-only, and no daemon is involved. 
 ASDPurchase *p  = [ASDPurchase new];
 p.bundleID      = bundleID;
 p.itemID        = adamID;
-p.buyParameters = @"salableAdamId=<id>&productType=C&price=0&pricingParameters=STDQ";
+p.buyParameters = @"salableAdamId=<id>&productType=C&price=0&pricingParameters=STDQ"
+                  @"&hasBeenAuthedForBuy=true&hasConfirmedPaymentSheet=true";
+p.isRedownload  = <in the locker?>;
 p.createsJobs   = YES;
 p.clientID      = @"com.apple.AppStore";
 p.purchaseID    = <nonzero random>;
 ```
 
-It is not. That is seven fields, and `ASDPurchase` has 30. The other 23 sit at their defaults, which is fine right up until one of them is the reason nothing installs.
+It is not. That is eight fields, and `ASDPurchase` has 30. The other 23 sit at their defaults, which is fine right up until one of them is the reason nothing installs.
 
 The list below is `-[ASDPurchase encodeWithCoder:]` at `0x199fab618` in **AppStoreDaemon (15.8.1)**. To be exact about what that gives you: it is the complete serialized state of the `ASDPurchase` object itself. It does not tell you what other arguments, connection state or daemon-side context participate in the call, only what this object carries across.
 
@@ -156,15 +182,19 @@ flowchart TD
     G1 -->|no| G2{"Gate 2<br/>biometric auth<br/>enabled for this account?"}
     G2 -->|yes, and enrolled| P2["Face ID / Touch ID prompt"]
     G2 -->|yes, not enrolled| P3["password prompt<br/><i>cannot be satisfied</i>"]
-    G2 -->|no| G3["Gate 3<br/>confirmation sheet"]
-    G3 --> T["AutoConfirmSheet dismisses it"]
-    T --> OK["install proceeds"]
+    G2 -->|no| G3{"Gate 3<br/>confirmation sheet"}
+    G3 -->|"buy params say it is<br/>already confirmed"| OK["install proceeds"]
+    G3 -->|"buy params withheld<br/>(--adam)"| T["AutoConfirmSheet dismisses it,<br/>then appstorectl replays"]
+    T --> OK
 
     style P1 fill:#FF6B35,color:#fff
     style P2 fill:#FF6B35,color:#fff
     style P3 fill:#c1121f,color:#fff
+    style T fill:#FF6B35,color:#fff
     style OK fill:#2EA043,color:#fff
 ```
+
+Gate 3 no longer fires on the default path: the store is told the sheet was already confirmed and does not raise one. The right-hand branch is what every install did until 2026-08-29 and is still what `--adam` gets.
 
 ### Gate 1, the password setting
 
@@ -294,6 +324,8 @@ flowchart TD
 The important part is what it does not do. It only ever dismisses, which is the same outcome as tapping outside the sheet. It cannot approve a payment and it cannot synthesize an authorization.
 
 There is one honest limit to state. `--force-dismiss` creates `/var/jb/tmp/.autoconfirm` before purchasing. The tweak accepts the flag for at most five minutes and consumes it when the first matching sheet appears; the CLI also removes it when the purchase call ends normally. The hook matches on process and controller class, not on anything tying the sheet to our specific purchase. If another matching payment sheet appeared during that window, it could be dismissed instead. That is a cancelled sheet rather than an approved payment, but it is a real race and not something the design rules out.
+
+That race is now off the default path, which is the main practical argument for the buy-params approach over this one: `--force-dismiss` is off unless asked for, so no flag is created and the window never opens.
 
 The dismissal selector also moved between releases, so it is probed at runtime rather than hardcoded:
 
