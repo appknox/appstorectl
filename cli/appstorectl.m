@@ -29,6 +29,7 @@
 #import <string.h>
 #import <sys/wait.h>
 
+#import "AMSDialogPrivate.h"
 #import "ASDPrivate.h"
 #import "account.h"
 #import "appstorectl.h"
@@ -80,7 +81,9 @@ static NSString *deviceCountryCode(void) {
     return cc.length == 2 ? [cc lowercaseString] : nil;
 }
 
-static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName) {
+/// outPrice receives the storefront price as an NSNumber, or nil if the lookup did not carry one.
+/// nil is not the same as free: treat an unknown price as paid.
+static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName, NSNumber **outPrice) {
     NSMutableArray<NSString *> *urls = [NSMutableArray array];
     NSString *cc = deviceCountryCode();
     if (cc) [urls addObject:[NSString stringWithFormat:
@@ -103,6 +106,10 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName) {
         NSNumber *trackId = r[@"trackId"];
         if (![trackId isKindOfClass:NSNumber.class]) continue;
         if (outName) *outName = r[@"trackName"];
+        if (outPrice) {
+            id price = r[@"price"];
+            *outPrice = [price isKindOfClass:NSNumber.class] ? price : nil;
+        }
         note(@"[+] %@  ->  adamId %@   (%@, %@ %@, minOS %@)",
              bundleID, trackId, r[@"trackName"] ?: @"?",
              r[@"price"] ?: @"?", r[@"currency"] ?: @"", r[@"minimumOsVersion"] ?: @"?");
@@ -129,43 +136,53 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName) {
 
 @implementation Observers
 
-- (void)handleDialogRequest:(id)request resultHandler:(id)handler {
-    note(@"[dialog] store requested a dialog");
-    [self answer:handler what:"dialog"];
-}
+// The block is (AMSDialogResult *, NSError *) — two object slots, result first. That is not a
+// guess: it is the inlined block signature from the protocol method-type table
+// __OBJC_$_PROTOCOL_METHOD_TYPES_ASDNotificationCenterDialogObserver in AppStoreDaemon,
+//   v32@0:8@"AMSDialogRequest"16@?<v@?@"AMSDialogResult"@"NSError">24
+// and it matches what Apple's own asclient does with the same handler. See AMSDialogPrivate.h.
+//
+// An earlier comment here claimed a dialog could not be answered affirmatively and that replaying
+// okButtonAction.buyParams was the only route. That was wrong, and it was wrong because the block
+// had been declared ^(BOOL, id): passing YES put the literal 0x1 where an object pointer belongs,
+// so NSXPC ran objc_opt_isKindOfClass on 0x1 and the process died. The slot was never a BOOL.
+//
+// Answering here should complete the purchase without a second round and without a sheet to
+// dismiss. The buyParams replay in cmdInstall stays as the backstop for the cases this cannot
+// reach — a password prompt or a TID signature, which no dialog answer can satisfy.
+- (void)handleDialogRequest:(AMSDialogRequest *)request
+              resultHandler:(void (^)(AMSDialogResult *, NSError *))handler {
+    AMSDialogAction *chosen = request.defaultAction ?: request.buttonActions.firstObject;
+    note(@"[dialog] %@ — %@", request.identifier ?: @"(no identifier)", request.message ?: @"(no message)");
 
-- (void)handleAuthenticateRequest:(id)request resultHandler:(id)handler {
-    note(@"[auth] store requested authentication");
-    [self answer:handler what:"auth"];
-}
-
-// The handler's arity and argument types are not in any header, and guessing wrong is a crash
-// rather than an error. Declaring it ^(BOOL, id) and calling blk(YES, nil) put the literal 0x1 in
-// the first slot, NSXPC ran objc_opt_isKindOfClass on it, and the process died with
-// EXC_BAD_ACCESS / KERN_INVALID_ADDRESS at 0x1 inside
-// -[NSXPCConnection _decodeAndInvokeMessageWithEvent:reply:flags:]. The first parameter is an
-// object pointer, not a BOOL. Passing NO only ever "worked" because 0 is a valid nil.
-//
-// @try does not help: it catches ObjC exceptions, not SIGSEGV.
-//
-// Note the difference from the no-argument rule in ASDPrivate.h. That rule holds when the callee
-// ignores its arguments, because the extra registers are then never read. This callee provably
-// reads slot 1, so invoking a no-arg block here would hand it whatever garbage x1 happened to
-// hold, which is worse than nil. The one register state observed safe across every run is all
-// zero, so pass explicit NULLs. void * slots keep ARC from emitting objc_storeStrong on them.
-//
-// The consequence is that this cannot express accept vs decline, and it never could. Answering a
-// dialog affirmatively is done by replaying the server's okButtonAction.buyParams in cmdInstall,
-// which needs no observer.
-- (void)answer:(id)handler what:(const char *)what {
     if (!handler) return;
-    @try {
-        void (^blk)(void *, void *, void *, void *) = handler;
-        blk(NULL, NULL, NULL, NULL);
-        note(@"[%s] replied nil; dialogs are answered by replaying buyParams", what);
-    } @catch (NSException *e) {
-        note(@"[%s] could not answer: %@", what, e.reason);
+    if (!self.autoAccept || !chosen) {
+        // Declining is a legitimate answer: a nil result is what the observer returns when it
+        // will not act, and the store then falls back to the replay path.
+        note(@"[dialog] not answering (%@)", chosen ? @"--accept not set" : @"no button actions");
+        handler(nil, nil);
+        return;
     }
+
+    Class resultClass = NSClassFromString(@"AMSDialogResult");
+    if (!resultClass) {
+        warnf(@"AMSDialogResult unavailable; AppleMediaServices did not load");
+        handler(nil, nil);
+        return;
+    }
+
+    AMSDialogResult *result = [[resultClass alloc] initWithOriginalRequest:request
+                                                 selectedActionIdentifier:chosen.identifier];
+    result.textfieldValues = @[];
+    note(@"[dialog] answering %@ (%@)", chosen.identifier ?: @"(no id)", chosen.title ?: @"");
+    handler(result, nil);
+}
+
+// Authentication is a password prompt. There is nothing to answer without credentials, so decline
+// and let the caller see the real reason rather than a timeout.
+- (void)handleAuthenticateRequest:(id)request resultHandler:(void (^)(id, NSError *))handler {
+    note(@"[auth] store requested authentication; declining (no credentials to supply)");
+    if (handler) handler(nil, nil);
 }
 
 // appstored delivers an NSArray of ASDProgress here, not a single object — the selector name is
@@ -436,14 +453,36 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
                       BOOL forceDismiss) {
     logLine(@"install: begin bundle=%@ adamOverride=%@ accept=%d tryConfirm=%d forceDismiss=%d",
             bundleID, adamID ?: @"(none)", autoAccept, autoConfirm, forceDismiss);
+    // Free-only, and the gate has to be explicit. The buy params below hardcode price=0 and now
+    // also assert hasBeenAuthedForBuy / hasConfirmedPaymentSheet, which tell the store the user has
+    // already seen and approved a payment sheet. On a free app that is true by construction — there
+    // is no sheet to approve. On a paid app it would be a lie that could complete a real charge
+    // with nothing shown on screen. asclient guards the same two params with
+    // `price == 0.0 || owned` (-[Installer _purchaseApp:], 0x100111db0); this is that guard.
+    //
+    // An explicit --adam skips the lookup, so there is no price to check. That is not a refusal:
+    // --adam exists for bundle IDs the device storefront will not resolve. It just means the two
+    // params are withheld and the purchase falls back to the sheet-and-replay route, which is what
+    // every install did before.
+    BOOL knownFree = NO;
     if (!adamID) {
         NSString *name = nil;
-        adamID = resolveAdamID(bundleID, &name);
+        NSNumber *price = nil;
+        adamID = resolveAdamID(bundleID, &name, &price);
         if (!adamID) {
             warnf(@"could not resolve an adamId for %@ — check the bundle ID, or pass --adam",
                   bundleID);
             return 66;
         }
+        knownFree = (price != nil && price.doubleValue == 0.0);
+        if (price != nil && !knownFree) {
+            warnf(@"%@ costs %@ — appstorectl installs free apps only", bundleID, price);
+            return 65;
+        }
+        if (!knownFree)
+            warnf(@"lookup returned no price for %@; treating it as paid", bundleID);
+    } else {
+        note(@"[=] --adam given, so the price is unknown; using the sheet-and-replay path");
     }
 
     if (isFullyInstalled(installedBundlePath(bundleID))) {
@@ -462,8 +501,20 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
     ASDPurchase *p  = [NSClassFromString(@"ASDPurchase") new];
     p.bundleID      = bundleID;                 // mandatory: the install coordinator is keyed by it
     p.itemID        = adamID;
-    p.buyParameters = [NSString stringWithFormat:
-        @"salableAdamId=%@&productType=C&price=0&pricingParameters=STDQ", adamID];
+    // hasBeenAuthedForBuy / hasConfirmedPaymentSheet are what Apple's own asclient sets on the
+    // FIRST attempt whenever the app is free or already owned, before the store has raised
+    // anything: -[Installer _purchaseApp:] (asclient 0x100111db0). appstorectl only ever saw them
+    // come back inside a rejection's okButtonAction.buyParams. Sending them up front stops the
+    // sheet being raised at all rather than dismissing it afterwards — measured 3/3 on 16.7.12
+    // with the AutoConfirmSheet tweak removed from the device entirely.
+    //
+    // Only when the lookup said the price is 0. See the gate above for why that matters.
+    p.buyParameters = knownFree
+        ? [NSString stringWithFormat:
+              @"salableAdamId=%@&productType=C&price=0&pricingParameters=STDQ"
+              @"&hasBeenAuthedForBuy=true&hasConfirmedPaymentSheet=true", adamID]
+        : [NSString stringWithFormat:
+              @"salableAdamId=%@&productType=C&price=0&pricingParameters=STDQ", adamID];
     p.createsJobs   = YES;
     p.clientID      = @"com.apple.AppStore";
     // Mandatory and easy to miss: purchaseID defaults to 0, and a job with purchaseID 0 is never
@@ -805,6 +856,11 @@ int main(int argc, char **argv) {
             logLine(@"dlopen AppStoreDaemon failed: %s", dlerror());
             return logEndSession(2);
         }
+        // AppStoreDaemon pulls this in already, but the dialog answer depends on AMSDialogResult
+        // being present and a missing class there is a silent decline rather than an error.
+        if (!dlopen("/System/Library/PrivateFrameworks/AppleMediaServices.framework/AppleMediaServices",
+                    RTLD_NOW))
+            logLine(@"dlopen AppleMediaServices failed: %s", dlerror());
 
         NSString *cmd = @(argv[1]);
         NSMutableArray<NSString *> *pos = [NSMutableArray array];
@@ -879,7 +935,7 @@ int main(int argc, char **argv) {
             // Say so. resolveAdamID only prints on success, so a miss used to exit 66 having
             // written nothing at all, which reads as the tool doing nothing rather than as a
             // bundle ID that is not in this storefront.
-            if (resolveAdamID(bundleID, NULL)) return logEndSession(0);
+            if (resolveAdamID(bundleID, NULL, NULL)) return logEndSession(0);
             warnf(@"could not resolve an adamId for %@ — check the bundle ID, or try another "
                    "storefront; the lookup follows the device locale, not the active account",
                   bundleID);
