@@ -1,6 +1,6 @@
 // appstorectl — buy and install an App Store app from the shell, by bundle ID.
 //
-//   appstorectl install   <bundle-id> [--adam <id>] [-o <path>] [--no-export|--no-decrypt|--no-dismiss]
+//   appstorectl install   <bundle-id> [--adam <id>] [-o <path>] [--evid <id>] [--no-export|--no-decrypt]
 //   appstorectl export    <bundle-id> [-o <path>] [--no-decrypt]
 //   appstorectl resolve   <bundle-id>
 //   appstorectl uninstall <bundle-id>
@@ -628,7 +628,13 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
     // AutoConfirmSheet consumes this flag when the purchase sheet appears and rejects it after five
     // minutes. We still remove it on every normal exit so it normally exists only during this call.
     NSString *const kAutoConfirmFlag = @"/var/jb/tmp/.autoconfirm";
+    NSString *const kAutoConfirmDylib =
+        @"/var/jb/Library/MobileSubstrate/DynamicLibraries/AutoConfirmSheet.dylib";
     NSFileManager *files = NSFileManager.defaultManager;
+    // Since the buy params above stop the sheet being raised at all, this normally arms a flag
+    // nothing ever reads. Do not claim the tweak will dismiss a sheet when the tweak is not even
+    // installed — the old line said that on every run and it was not true on any of them.
+    BOOL tweakInstalled = [files fileExistsAtPath:kAutoConfirmDylib];
     if (forceDismiss) {
         [files removeItemAtPath:kAutoConfirmFlag error:NULL];
         if (![files createFileAtPath:kAutoConfirmFlag contents:nil attributes:nil]) {
@@ -642,7 +648,10 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
             [files removeItemAtPath:kAutoConfirmFlag error:NULL];
             return 3;
         }
-        note(@"[+] force-dismiss armed (AutoConfirmSheet tweak will dismiss the sheet)");
+        if (tweakInstalled)
+            logLine(@"force-dismiss armed; AutoConfirmSheet is installed");
+        else
+            logLine(@"force-dismiss armed, but AutoConfirmSheet is not installed — no effect");
     }
     void (^disarm)(void) = ^{
         if (!forceDismiss) return;
@@ -928,17 +937,19 @@ static void usage(void) {
         "  The first login for an Apple ID on a device needs a verification code typed once;\n"
         "  login asks for it automatically. --no-bootstrap fails instead, for unattended use.\n"
         "  logout is the only way to remove an account: Settings lists only the active one.\n\n"
-        "  install exports and decrypts by default, and arms the tweak to dismiss the sheet.\n"
+        "  install exports and decrypts by default. It no longer arms the tweak: the buy params\n"
+        "  it sends stop the store raising a confirmation sheet at all.\n"
         "  Decryption launches the app on the device, so a run is slower than a bare install.\n"
         "  --no-export     install only; do not package an IPA\n"
         "  --no-decrypt    package an encrypted IPA (cryptid 1) instead\n"
-        "  --no-dismiss    do not arm the tweak; the sheet needs a human\n"
+        "  --force-dismiss arm the AutoConfirmSheet tweak; only needed if a sheet still appears\n"
         "  --no-preflight  skip the biometric pre-flight (see docs/GATES.md gate 2)\n"
         "  -o <path>    export destination (default /var/jb/tmp/appstorectl-exports/)\n"
         "  --adam <id>  skip store lookup and use this adamId\n"
         "  --evid <id>  install a specific build; `versions` lists what the store will serve\n"
         "  --accept       auto-answer store dialogs affirmatively\n"
-        "  --export, --decrypt, --force-dismiss are accepted and redundant; they are the defaults\n"
+        "  --export, --decrypt are accepted and redundant; they are the defaults\n"
+        "  --no-dismiss is accepted and redundant; not arming the tweak is now the default\n"
         "  --try-confirm  attempt to answer the confirmation sheet (does not currently work)\n"
         "\n"
         "The store shows a confirmation sheet for the first purchase. Dismiss it (tapping\n"
@@ -984,7 +995,11 @@ int main(int argc, char **argv) {
         // On by default. This is the flow that gets run every time: buy it, get it off the device,
         // get it readable. The opt-outs exist for the rare run that wants something narrower, and
         // the old positive flags are still accepted so nothing already scripted breaks.
-        BOOL forceDismiss = YES;
+        // Off by default since the buy params stop the sheet being raised at all on the free-app
+        // path. --force-dismiss turns it back on for the cases that path does not cover: --adam,
+        // which withholds the preauth params, and any account state not yet mapped (Ask to Buy, a
+        // biometric requirement, freeDownloadsPasswordSetting still unset).
+        BOOL forceDismiss = NO;
         BOOL alsoExport = YES;
         BOOL decryptExport = YES;
         BOOL skipPreflight = NO;
