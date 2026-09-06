@@ -29,7 +29,9 @@
 #import <string.h>
 #import <sys/wait.h>
 
-#import "AMSDialogPrivate.h"
+#import "store/AMSPrivate.h"
+#import "store/buyparams.h"
+#import "store/versions.h"
 #import "ASDPrivate.h"
 #import "account.h"
 #import "appstorectl.h"
@@ -178,6 +180,23 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName, NSNumber 
     handler(result, nil);
 }
 
+// The same dialog, arriving from AMSPurchaseQueue instead of appstored. Different selector, four
+// arguments instead of two, identical payload — so hand it to the two-argument version rather than
+// duplicating the logic.
+- (void)handleDialogRequest:(AMSDialogRequest *)request
+                   purchase:(id)purchase
+              purchaseQueue:(id)queue
+                 completion:(void (^)(AMSDialogResult *, NSError *))completion {
+    [self handleDialogRequest:request resultHandler:completion];
+}
+
+- (void)handleAuthenticateRequest:(id)request
+                         purchase:(id)purchase
+                    purchaseQueue:(id)queue
+                       completion:(void (^)(id, NSError *))completion {
+    [self handleAuthenticateRequest:request resultHandler:completion];
+}
+
 // Authentication is a password prompt. There is nothing to answer without credentials, so decline
 // and let the caller see the real reason rather than a timeout.
 - (void)handleAuthenticateRequest:(id)request resultHandler:(void (^)(id, NSError *))handler {
@@ -215,52 +234,85 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName, NSNumber 
 @end
 
 
-// When the store wants a confirmation it replies with a ConfirmPaymentSheet dialog whose
-// okButtonAction.buyParams already contains a confirmedPaymentUUID — i.e. the server hands us
-// exactly what to resend once the user says yes. The payload only reaches us as a description
-// string, so pull the buyParams out of it textually.
-// Scrape okButtonAction.buyParams out of a payload rendered as a description string.
-// iOS 15.x only exposes the payload this way, under AMSServerPayload_desc.
-static NSString *buyParamsFromDescription(NSString *desc) {
-    if (![desc isKindOfClass:NSString.class]) return nil;
-    NSRange key = [desc rangeOfString:@"buyParams = \""];
-    if (key.location == NSNotFound) return nil;
-    NSUInteger start = key.location + key.length;
-    NSRange end = [desc rangeOfString:@"\"" options:0 range:NSMakeRange(start, desc.length - start)];
-    if (end.location == NSNotFound) return nil;
-    return [desc substringWithRange:NSMakeRange(start, end.location - start)];
+#pragma mark - Version enumeration
+
+/// Dump the store's metadata lookup for a bundle id. Undocumented on purpose: it is a research
+/// affordance, not a feature, and the shape it prints is Apple's, not ours.
+static int cmdLookupRaw(NSString *bundleID) {
+    NSError *err = nil;
+    NSDictionary *item = storeLookupForBundleID(bundleID, &err);
+    if (!item) {
+        warnf(@"lookup failed for %@: %@", bundleID, err.localizedDescription ?: @"unknown");
+        printErrorChain(err, 1);
+        return 1;
+    }
+    note(@"%@", item);
+    return 0;
 }
 
-// The store answers a confirmation-required purchase with a dialog whose okButtonAction.buyParams
-// already contains a confirmedPaymentUUID — the server telling us exactly what to resend once the
-// user says yes. Replaying it completes the purchase with no second sheet.
-//
-// Where that payload lives is NOT stable across iOS versions:
-//   15.8.1 (19H380)  userInfo["AMSServerPayload_desc"]  — a description STRING
-//   16.7.12 (20H364) userInfo["AMSServerPayload"]       — a real NSDictionary
-// Prefer the dictionary (structured, no parsing) and fall back to scraping any string-valued key
-// that looks like a server payload.
-static NSString *confirmBuyParamsFromError(NSError *err) {
-    NSDictionary *userInfo = err.userInfo;
-
-    id payload = userInfo[@"AMSServerPayload"];
-    if ([payload isKindOfClass:NSDictionary.class]) {
-        id action = [[payload objectForKey:@"dialog"] objectForKey:@"okButtonAction"];
-        id params = [action isKindOfClass:NSDictionary.class]
-                  ? [action objectForKey:@"buyParams"] : nil;
-        if ([params isKindOfClass:NSString.class] && [params length]) return params;
+static int cmdVersions(NSString *bundleID, NSString *paramsOverride) {
+    NSString *name = nil;
+    NSNumber *price = nil;
+    NSNumber *adamID = resolveAdamID(bundleID, &name, &price);
+    if (!adamID) { warnf(@"could not resolve an adamId for %@", bundleID); return 66; }
+    if (price == nil || price.doubleValue != 0.0) {
+        warnf(@"%@ is not a free app — appstorectl handles free apps only", bundleID);
+        return 65;
     }
 
-    // Either the key is the _desc variant, or the dictionary was shaped differently than expected.
-    for (NSString *key in userInfo) {
-        if (![key hasPrefix:@"AMSServerPayload"]) continue;
-        id value = userInfo[key];
-        NSString *params = buyParamsFromDescription(
-            [value isKindOfClass:NSString.class] ? value : [value description]);
-        if (params.length) return params;
+    // The metadata lookup is a plain read: no purchase, no sheet. It carries the build the store
+    // would serve right now and its own buy-params string, which is a better starting point than a
+    // hand-built one (it has pg=default and appExtVrsId, which ours does not).
+    NSString *serverParams = paramsOverride;
+    if (!serverParams) {
+        NSError *lookupErr = nil;
+        NSDictionary *item = storeLookupForBundleID(bundleID, &lookupErr);
+        NSDictionary *ios = item[@"attributes"][@"platformAttributes"][@"ios"];
+        id current = ios[@"externalVersionId"];
+        if (current) note(@"[+] current build: evid %@  (minOS %@)", current,
+                          ios[@"minimumOSVersion"] ?: @"?");
+
+        id offers = ios[@"offers"];
+        id params = [offers isKindOfClass:NSArray.class] ? [offers firstObject][@"buyParams"] : nil;
+        if ([params isKindOfClass:NSString.class]) serverParams = params;
+        else logLine(@"versions: no server buyParams (%@); using the built-in string",
+                     lookupErr.localizedDescription ?: @"offers missing");
     }
-    return nil;
+
+    // The queue can raise a dialog mid-lookup, and an unanswered one stalls it until the timeout.
+    Observers *observers = [Observers new];
+    observers.autoAccept = YES;
+    observers.bundleID   = bundleID;
+
+    NSError *err = nil;
+    NSArray<NSNumber *> *evids = storeEvidsForAdamID(adamID, bundleID, serverParams, observers, &err);
+    if (!evids) {
+        warnf(@"could not list older versions for %@: %@", bundleID,
+              err.localizedDescription ?: @"unknown");
+        printErrorChain(err, 1);
+        // Say what is actually wrong rather than leaving a bare 500 on screen. This is a known
+        // wall, not a transient failure — see store/versions.m for what was tried.
+        note(@"    The version list only exists in a fulfilled purchase response, and MZBuy will");
+        note(@"    not fulfil one from this process. The current build above still works with");
+        note(@"    --evid, and any evid you have from elsewhere does too.");
+        return 1;
+    }
+
+    note(@"[+] %lu version(s), oldest first. The last one is what a plain install gets.",
+         (unsigned long)evids.count);
+    NSUInteger offset = evids.count - 1;
+    for (NSNumber *evid in evids) {
+        note(@"    evid %-12@  offset %lu%@", evid, (unsigned long)offset,
+             offset == 0 ? @"  (current)" : @"");
+        offset--;
+    }
+    return 0;
 }
+
+
+// The dialog-carried buy params moved to store/buyparams.m when the version lookup needed the same
+// extraction. This alias keeps the call sites below reading the way they always did.
+static NSString *confirmBuyParamsFromError(NSError *err) { return serverBuyParamsFromError(err); }
 
 // Not every sheet is the same sheet, and dismissing only works for one of them. Observed dialogs:
 //
@@ -449,8 +501,8 @@ static JobState jobStateFor(NSString *bundleID) {
     return state;
 }
 
-static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOOL autoConfirm,
-                      BOOL forceDismiss) {
+static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL autoAccept,
+                      BOOL autoConfirm, BOOL forceDismiss) {
     logLine(@"install: begin bundle=%@ adamOverride=%@ accept=%d tryConfirm=%d forceDismiss=%d",
             bundleID, adamID ?: @"(none)", autoAccept, autoConfirm, forceDismiss);
     // Free-only, and the gate has to be explicit. The buy params below hardcode price=0 and now
@@ -515,6 +567,15 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, BOOL autoAccept, BOO
               @"&hasBeenAuthedForBuy=true&hasConfirmedPaymentSheet=true", adamID]
         : [NSString stringWithFormat:
               @"salableAdamId=%@&productType=C&price=0&pricingParameters=STDQ", adamID];
+    // Pin a specific build. appExtVrsId is the key on the normal (DSID-carrying) path;
+    // externalVersionId is the DSID-less spelling, and asclient sends that one only when it is
+    // installing DSID-less: -[Installer _purchaseApp:] (0x100111db0). We are never DSID-less here.
+    //
+    // `appstorectl versions <bundle-id>` lists what the store will serve.
+    if (evid) {
+        p.buyParameters = [p.buyParameters stringByAppendingFormat:@"&appExtVrsId=%@", evid];
+        note(@"[+] pinning external version id %@", evid);
+    }
     p.createsJobs   = YES;
     p.clientID      = @"com.apple.AppStore";
     // Mandatory and easy to miss: purchaseID defaults to 0, and a job with purchaseID 0 is never
@@ -805,9 +866,10 @@ static int cmdJobs(void) {
 static void usage(void) {
     fprintf(stderr,
         "appstorectl — install and export free App Store apps from the shell\n\n"
-        "  appstorectl install   <bundle-id> [--adam <id>] [-o <path>]\n"
+        "  appstorectl install   <bundle-id> [--adam <id>] [--evid <id>] [-o <path>]\n"
         "  appstorectl export    <bundle-id> [-o <path>]\n"
         "  appstorectl resolve   <bundle-id>\n"
+        "  appstorectl versions  <bundle-id>\n"
         "  appstorectl uninstall <bundle-id>\n"
         "  appstorectl jobs\n"
         "  appstorectl version\n\n"
@@ -828,6 +890,7 @@ static void usage(void) {
         "  --no-preflight  skip the biometric pre-flight (see docs/GATES.md gate 2)\n"
         "  -o <path>    export destination (default /var/jb/tmp/appstorectl-exports/)\n"
         "  --adam <id>  skip store lookup and use this adamId\n"
+        "  --evid <id>  install a specific build; `versions` lists what the store will serve\n"
         "  --accept       auto-answer store dialogs affirmatively\n"
         "  --export, --decrypt, --force-dismiss are accepted and redundant; they are the defaults\n"
         "  --try-confirm  attempt to answer the confirmation sheet (does not currently work)\n"
@@ -884,6 +947,8 @@ int main(int argc, char **argv) {
         BOOL allowBootstrap = YES;
         NSString *exportPath = nil;
         NSString *passwordFile = nil;
+        NSNumber *evid = nil;
+        NSString *paramsOverride = nil;
 
         for (int i = 2; i < argc; i++) {
             NSString *a = @(argv[i]);
@@ -915,6 +980,14 @@ int main(int argc, char **argv) {
                 adamOverride = @(atoll(argv[++i]));
                 continue;
             }
+            if ([a isEqualToString:@"--params"] && i + 1 < argc) {
+                paramsOverride = @(argv[++i]);
+                continue;
+            }
+            if ([a isEqualToString:@"--evid"] && i + 1 < argc) {
+                evid = @(atoll(argv[++i]));
+                continue;
+            }
             [pos addObject:a];
         }
 
@@ -941,6 +1014,8 @@ int main(int argc, char **argv) {
                   bundleID);
             return logEndSession(66);
         }
+        if ([cmd isEqualToString:@"_lookup-raw"]) return logEndSession(cmdLookupRaw(bundleID));
+        if ([cmd isEqualToString:@"versions"])  return logEndSession(cmdVersions(bundleID, paramsOverride));
         if ([cmd isEqualToString:@"uninstall"]) return logEndSession(cmdUninstall(bundleID));
         if ([cmd isEqualToString:@"export"])    return logEndSession(cmdExport(bundleID, exportPath, decryptExport));
         if ([cmd isEqualToString:@"install"]) {
@@ -949,7 +1024,7 @@ int main(int argc, char **argv) {
             // that is the difference between a hands-off install and a dead end.
             if (!skipPreflight) biometricPreflight();
 
-            int rc = cmdInstall(bundleID, adamOverride, autoAccept, autoConfirm, forceDismiss);
+            int rc = cmdInstall(bundleID, adamOverride, evid, autoAccept, autoConfirm, forceDismiss);
             // Only package what actually installed — exporting after a failed install would either
             // error confusingly or silently archive a stale copy from an earlier run.
             if (rc != 0 || !alsoExport) return logEndSession(rc);

@@ -28,5 +28,21 @@
 	     com.apple.accounts code 7. -->
 	<key>com.apple.private.accounts.allaccounts</key>
 	<true/>
+
+	<!-- `versions`. Asking the store for an app's version list goes through AMSPurchaseQueue in
+	     this process rather than through appstored, and the store will not answer without anisette
+	     attestation. Without these two the request reaches p26-buy.itunes.apple.com, gets HTTP 200,
+	     and comes back AMSErrorDomain 307 "Anisette Provisioning Failed" / AMSAnisetteErrorCode
+	     -45002 — the machine data could not be produced.
+
+	     ADI keeps its provisioning in the keychain under the `apple` access group, which a binary
+	     with no keychain-access-groups at all cannot reach. Both values are copied from Apple's own
+	     asclient (com.apple.asclient), which does the same in-process lookup. -->
+	<key>adi-client</key>
+	<string>409835401</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>apple</string>
+	</array>
 </dict>
 </plist>
