@@ -17,6 +17,11 @@
 /// appstored. Reads like productType=C&price=0&salableAdamId=…&pricingParameters=STDRDL.
 @property (copy) NSString *redownloadParams;
 @property (assign) BOOL hidden;
+/// A URL the store hands out for the app's package. Whether it is actually fetchable, and whether
+/// it is the full asset or only a preflight stub, is the open question — see `_library-raw`.
+@property (copy) NSString *preflightPackageURL;
+/// -[ASDPurchaseHistoryApp description], verbatim. Only for looking at what else is in there.
+@property (copy) NSString *rawDescription;
 @end
 
 /// Everything the active account owns, or nil on failure. bundleIDs narrows the query when non-nil.

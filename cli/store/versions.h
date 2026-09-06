@@ -33,6 +33,13 @@ NSDictionary *storeLookupForBundleID(NSString *bundleID, NSError **outError);
 /// buyParamsOverride replaces the whole generated string when non-nil. The store 500s on a
 /// buy-params string it considers incomplete, and which fields it wants is not documented anywhere,
 /// so this exists to bisect that from the shell rather than from a rebuild.
+/// purchaseType selects which flavour of purchase is enqueued. asclient uses 0 for a normal
+/// purchase, 2 for DSID-less, and 5 for the VPP/HRN flow that reads a download URL out of the
+/// response (-[VPPCommand _generateHRNRequest:options:] 0x1001190ac). Pass 0 unless probing.
+///
+/// outResponse, when non-NULL, receives the raw store response from the last round even on
+/// failure. The version list is one field of it; a download URL would be another.
 NSArray<NSNumber *> *storeEvidsForAdamID(NSNumber *adamID, NSString *bundleID,
-                                         NSString *buyParamsOverride,
-                                         id dialogDelegate, NSError **outError);
+                                         NSString *buyParamsOverride, long long purchaseType,
+                                         id dialogDelegate, NSDictionary **outResponse,
+                                         NSError **outError);

@@ -268,6 +268,23 @@ static int cmdLibrary(NSString *filter) {
     return 0;
 }
 
+/// Everything appstored holds about one owned app. Undocumented; this exists to answer whether
+/// preflightPackageURL and redownloadParams are usable without a store round trip.
+static int cmdLibraryRaw(NSString *bundleID) {
+    NSError *err = nil;
+    NSArray<LibraryApp *> *apps = accountLibrary(@[bundleID], &err);
+    if (!apps.count) {
+        warnf(@"nothing for %@: %@", bundleID, err.localizedDescription ?: @"not in the library");
+        return 1;
+    }
+    for (LibraryApp *app in apps) {
+        note(@"preflightPackageURL = %@", app.preflightPackageURL ?: @"(nil)");
+        note(@"redownloadParams    = %@", app.redownloadParams ?: @"(nil)");
+        note(@"---- raw ----\n%@", app.rawDescription ?: @"(nil)");
+    }
+    return 0;
+}
+
 /// Dump the store's metadata lookup for a bundle id. Undocumented on purpose: it is a research
 /// affordance, not a feature, and the shape it prints is Apple's, not ours.
 static int cmdLookupRaw(NSString *bundleID) {
@@ -282,7 +299,7 @@ static int cmdLookupRaw(NSString *bundleID) {
     return 0;
 }
 
-static int cmdVersions(NSString *bundleID, NSString *paramsOverride) {
+static int cmdVersions(NSString *bundleID, NSString *paramsOverride, long long purchaseType) {
     NSString *name = nil;
     NSNumber *price = nil;
     NSNumber *adamID = resolveAdamID(bundleID, &name, &price);
@@ -317,7 +334,13 @@ static int cmdVersions(NSString *bundleID, NSString *paramsOverride) {
     observers.bundleID   = bundleID;
 
     NSError *err = nil;
-    NSArray<NSNumber *> *evids = storeEvidsForAdamID(adamID, bundleID, serverParams, observers, &err);
+    NSDictionary *response = nil;
+    NSArray<NSNumber *> *evids = storeEvidsForAdamID(adamID, bundleID, serverParams, purchaseType,
+                                                     observers, &response, &err);
+    // --ptype is a probe, so show what came back whatever happened. A fulfilled response is the
+    // whole question: songList[0].URL is the download URL vpp hrn reads.
+    if (purchaseType != 0)
+        note(@"---- raw response (purchaseType %lld) ----\n%@", purchaseType, response ?: @"(nil)");
     if (!evids) {
         warnf(@"could not list older versions for %@: %@", bundleID,
               err.localizedDescription ?: @"unknown");
@@ -1015,6 +1038,7 @@ int main(int argc, char **argv) {
         NSString *passwordFile = nil;
         NSNumber *evid = nil;
         NSString *paramsOverride = nil;
+        long long purchaseType = 0;
 
         for (int i = 2; i < argc; i++) {
             NSString *a = @(argv[i]);
@@ -1044,6 +1068,10 @@ int main(int argc, char **argv) {
             }
             if ([a isEqualToString:@"--adam"] && i + 1 < argc) {
                 adamOverride = @(atoll(argv[++i]));
+                continue;
+            }
+            if ([a isEqualToString:@"--ptype"] && i + 1 < argc) {
+                purchaseType = atoll(argv[++i]);
                 continue;
             }
             if ([a isEqualToString:@"--params"] && i + 1 < argc) {
@@ -1081,8 +1109,9 @@ int main(int argc, char **argv) {
                   bundleID);
             return logEndSession(66);
         }
-        if ([cmd isEqualToString:@"_lookup-raw"]) return logEndSession(cmdLookupRaw(bundleID));
-        if ([cmd isEqualToString:@"versions"])  return logEndSession(cmdVersions(bundleID, paramsOverride));
+        if ([cmd isEqualToString:@"_lookup-raw"])  return logEndSession(cmdLookupRaw(bundleID));
+        if ([cmd isEqualToString:@"_library-raw"]) return logEndSession(cmdLibraryRaw(bundleID));
+        if ([cmd isEqualToString:@"versions"])  return logEndSession(cmdVersions(bundleID, paramsOverride, purchaseType));
         if ([cmd isEqualToString:@"uninstall"]) return logEndSession(cmdUninstall(bundleID));
         if ([cmd isEqualToString:@"export"])    return logEndSession(cmdExport(bundleID, exportPath, decryptExport));
         if ([cmd isEqualToString:@"install"]) {

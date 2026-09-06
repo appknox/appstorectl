@@ -22,6 +22,7 @@
 @property (readonly) NSDate *datePurchased;
 @property (readonly) NSString *redownloadParams;
 @property (readonly, getter=isHidden) BOOL hidden;
+@property (readonly) NSString *preflightPackageURL;
 @end
 
 /// Both signatures are read out of the protocol method-type table in AppStoreDaemon, not guessed.
@@ -135,6 +136,9 @@ NSArray<LibraryApp *> *accountLibrary(NSArray<NSString *> *bundleIDs, NSError **
         entry.datePurchased    = app.datePurchased;
         entry.redownloadParams = app.redownloadParams;
         entry.hidden           = app.isHidden;
+        if ([app respondsToSelector:@selector(preflightPackageURL)])
+            entry.preflightPackageURL = app.preflightPackageURL;
+        entry.rawDescription = [app description];
         [out addObject:entry];
     }
     return out;

@@ -64,8 +64,9 @@ NSDictionary *storeLookupForBundleID(NSString *bundleID, NSError **outError) {
 }
 
 NSArray<NSNumber *> *storeEvidsForAdamID(NSNumber *adamID, NSString *bundleID,
-                                         NSString *buyParamsOverride,
-                                         id dialogDelegate, NSError **outError) {
+                                         NSString *buyParamsOverride, long long purchaseType,
+                                         id dialogDelegate, NSDictionary **outResponse,
+                                         NSError **outError) {
     Class queueClass  = NSClassFromString(@"AMSPurchaseQueue");
     Class configClass = NSClassFromString(@"AMSPurchaseQueueConfiguration");
     Class buyClass    = NSClassFromString(@"AMSBuyParams");
@@ -111,7 +112,7 @@ NSArray<NSNumber *> *storeEvidsForAdamID(NSNumber *adamID, NSString *bundleID,
     for (int round = 0; round < 2 && params; round++) {
         logLine(@"versions: round %d buyParams = %@", round, params);
         AMSPurchase *purchase =
-            [[purchClass alloc] initWithPurchaseType:0
+            [[purchClass alloc] initWithPurchaseType:purchaseType
                                            buyParams:[buyClass buyParamsWithString:params]];
         purchase.account       = account;
         purchase.logUUID       = [NSString stringWithFormat:@"versions:%@:%@", bundleID ?: @"?", adamID];
@@ -156,6 +157,8 @@ NSArray<NSNumber *> *storeEvidsForAdamID(NSNumber *adamID, NSString *bundleID,
         note(@"[+] store asked to confirm; resending its own buy params");
         params = resend;
     }
+
+    if (outResponse) *outResponse = response;
 
     // songList is the normal shape; asclient falls back to `items`, so do the same.
     id list = response[@"songList"] ?: response[@"items"];
