@@ -35,7 +35,7 @@ An install can run unattended once the account and device authorization state al
 - Rootless jailbreak on a device running a compatible iOS release
 - A signed-in App Store account
 - Theos for building
-- ElleKit, `com.autopear.installipa`, and `zip` on the device
+- `com.autopear.installipa` and `zip` on the device
 
 Tested configurations:
 
@@ -59,7 +59,7 @@ To install a built package manually:
 
 ```sh
 scp packages/*.deb root@<device-ip>:/var/jb/tmp/
-ssh root@<device-ip> 'apt install /var/jb/tmp/com.appknox.appstorectl_*.deb && killall -9 PassbookUIService'
+ssh root@<device-ip> 'apt install /var/jb/tmp/com.appknox.appstorectl_*.deb'
 ```
 
 Uninstall with:
@@ -78,6 +78,7 @@ appstorectl resolve   <bundle-id>
 appstorectl search    <term> [-l <count>]
 appstorectl versions  <bundle-id>
 appstorectl library   [<bundle-id>]
+appstorectl storefront [<id>]
 appstorectl uninstall <bundle-id>
 appstorectl jobs
 appstorectl version
@@ -89,38 +90,31 @@ appstorectl logout    <apple-id> [--force]
 authpref [free|paid] [always|sometimes|never]
 ```
 
-`install` purchases a free app, waits for installation, exports it, and decrypts the export. Use these options to narrow that default flow:
-
-`purchase` acquires a free app license for the signed-in account and cancels the download before
-installation.
+`install` purchases a free app, installs it, then exports and decrypts it. `purchase` acquires only
+the license by cancelling the install job.
 
 | Option | Effect |
 |---|---|
 | `--no-export` | Install without creating an IPA. |
 | `--no-decrypt` | Keep exported images FairPlay-encrypted at `cryptid 1`. |
-| `--force-dismiss` | Arm AutoConfirmSheet. Off by default; only needed if a confirmation sheet still appears. See [docs/GATES.md](docs/GATES.md) gate 3. |
 | `--no-preflight` | Skip the biometric-state preflight. |
-| `--adam <id>` | Skip metadata lookup and use this `adamId`. Also skips the price check, so the sheet-suppressing buy params are withheld and the sheet may appear. |
+| `--adam <id>` | Skip metadata lookup and use this `adamId`. This also skips the price check. |
 | `--evid <id>` | Install a specific build instead of the current one. `versions` prints the current build's id. |
 | `--accept` | Answer store dialogs affirmatively. The last-compatible-version dialog is handled automatically without this flag. |
 | `-o <path>` | Set the export path. The default directory is `/var/jb/tmp/appstorectl-exports/`. |
 | `-q` | Print only errors. Persistent logging remains enabled. |
 
-`install` handles free apps only, and now says so before contacting the store: a paid bundle id exits 65 with its price, rather than attempting a purchase that would fail later.
+Paid apps are rejected before the purchase service is contacted.
 
-`search` queries the public iTunes Search API for iOS apps and prints each match's name, bundle ID,
-adamId, version, minimum iOS and price. It returns five results by default; use `-l` to change the
-limit. Search follows the active account's storefront, falling back to the device region when it
-cannot map that storefront.
+`search` prints an app's name, bundle ID, adam ID, version, minimum iOS and price. It returns five
+results by default; use `-l` to change the limit.
 
-`library` lists what the signed-in Apple ID owns, which is not the same as what is installed — an app can be owned and absent. `install` uses it to ask the store for a redownload rather than a purchase when the app is already in the locker.
+`library` lists apps owned by the signed-in Apple ID. `storefront` reads or changes the local account
+storefront value; it does not change the Apple ID's server-side country.
 
-`versions` prints the current catalog build and its minimum iOS. If an app already belongs to the
-account and its current build is too new for the device, `install` accepts Apple's
-last-compatible-version offer and installs the server-selected older build automatically. An
-unowned app must first be acquired on a compatible device. appstorectl does not guess from the
-EVID list. `versions` still cannot enumerate that list; if you already have an EVID from elsewhere,
-`--evid` installs it directly.
+`versions` prints the current catalog build. For an owned app that requires a newer iOS, `install`
+accepts Apple's last-compatible version when offered. `--evid` installs a known build ID; historical
+build enumeration is not available.
 
 `login` reads the password from `--password-file`, then `APPSTORECTL_PASSWORD`, then a terminal prompt. Do not pass a password directly on the command line. `--show-password` echoes terminal input, and `--no-bootstrap` fails instead of requesting the first-login verification code. `logout --force` permits removal of the active account. Account behavior is documented in [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
@@ -146,6 +140,7 @@ Decryption launches the app or extension and reads the FairPlay-decrypted pages 
 Known limitations:
 
 - Only free-app purchases have been implemented and tested.
+- An unowned app that requires a newer iOS must first be acquired on a compatible device.
 - On-Demand Resource asset packs are not present in the installed bundle and cannot be exported.
 - Decryption requires the target to launch far enough for its encrypted image to be mapped.
 - The decrypt helper is arm64. It can drive arm64e targets.
@@ -153,21 +148,11 @@ Known limitations:
 
 See [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) for the complete flow and validation details.
 
-## Authorization and AutoConfirmSheet
+## Authorization
 
-Three independent conditions can require interaction:
-
-1. The Apple ID password policy for free downloads. `authpref free never` can change it, but this is an optimization rather than an installation prerequisite.
-2. Biometric purchase authorization. The preflight only clears an enabled state that has no valid enrolled identity. It leaves a working Face ID or Touch ID configuration alone.
-3. The ordinary purchase confirmation sheet. **No longer raised for a free app.** The purchase now carries `hasBeenAuthedForBuy` and `hasConfirmedPaymentSheet`, which is what Apple's own internal App Store CLI sends for a free or already-owned app, and the store does not ask.
-
-Because nothing asks, nothing needs dismissing. **AutoConfirmSheet is no longer built into the package** — nothing is injected into PassbookUIService, and the package no longer depends on `ellekit`. Its source stays in `tweak/`; adding `tweak` back to `SUBPROJECTS` in the top-level `Makefile` restores it.
-
-`--force-dismiss` still exists and still arms the flag, for the cases the buy params do not cover: `--adam` withholds them, and Ask to Buy and required-biometric accounts are untested against the new path. With no tweak installed it warns that nothing will act on the flag.
-
-When armed, `--force-dismiss` creates `/var/jb/tmp/.autoconfirm`. The tweak accepts a flag for at most five minutes and consumes it when the first matching sheet appears. It acts only inside PassbookUIService and only on `PKPaymentAuthorizationRemoteAlertViewController`, and it dismisses — it never approves or authorizes a payment. The CLI removes the flag when the purchase call ends normally.
-
-See [docs/GATES.md](docs/GATES.md) when an install still requests a password or biometric approval.
+Free-app purchases normally avoid the confirmation sheet. Password, biometric and Ask to Buy
+policies may still require interaction; [docs/GATES.md](docs/GATES.md) covers those cases.
+AutoConfirmSheet remains in `tweak/` for research but is not included in the package.
 
 ## Logs and privacy
 
@@ -177,13 +162,11 @@ See [docs/GATES.md](docs/GATES.md) when an install still requests a password or 
 rm /var/jb/var/log/appstorectl.log
 ```
 
-AutoConfirmSheet writes its decisions to `/var/jb/tmp/autoconfirm.log`.
-
 ## Troubleshooting
 
 **The install stalls at `percentComplete -1`.** Check the app's minimum OS with `appstorectl resolve <bundle-id>`. Use `appstorectl jobs` to inspect stuck jobs.
 
-**Every purchase requests a password or biometric approval.** Check the returned `dialogId`, then use [docs/GATES.md](docs/GATES.md) to identify the remaining authorization condition.
+**A purchase requests approval.** Use the returned `dialogId` and [docs/GATES.md](docs/GATES.md) to identify the remaining authorization condition.
 
 **`zip failed`.** Install the dependency with `apt install zip`. Use `apt install` for the project package so its declared dependencies are resolved.
 

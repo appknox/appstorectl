@@ -120,18 +120,14 @@ okButtonAction.buyParams = "isInApp=false&icloud-backup-enabled=1&clientCorrelat
 agrees. That mechanism is what makes hands-off operation possible — dismiss the sheet, take the
 `confirmedPaymentUUID` it hands back, resend.
 
-## Incompatible apps stall silently
+## Incompatible apps depend on account ownership
 
-An app whose `minimumOsVersion` exceeds the device is **still purchased**. appstored creates a
-placeholder, and the job parks at `percentComplete -1` with `failureError = nil`. There is no error
-at any layer.
+For an owned app, appstored can offer the last compatible build through
+`MZCommerce.ProductRequiresLaterStoreVersion`; appstorectl accepts that action automatically. If
+Apple has no compatible build, the install fails with the server's message.
 
-Observed with Chrome (minOS 18.0 on iOS 15.8.1). The store served version `152.x` — the current
-build — rather than a last-compatible one.
-
-`cancelJobsWithIDs:` clears both job and placeholder container, leaving no orphan icon.
-
-Check `minOS` with `resolve` first.
+An unowned app whose current version requires a newer iOS is rejected before the license is added.
+Acquire it once on a compatible device, then retry on the older device.
 
 ## No complete IPA was found on disk
 

@@ -36,7 +36,7 @@ What the evidence does support, and what actually matters for the rest of this: 
 
 ## One install, start to finish
 
-Here is the real sequence for `appstorectl install <bundle-id>`. Everything later in this document is a detail hanging off one of these steps, so it is worth having the map first.
+The default install path is:
 
 ```mermaid
 sequenceDiagram
@@ -64,35 +64,9 @@ sequenceDiagram
     C-->>U: installed, version, path
 ```
 
-One round trip, no sheet, no replay. That is a change from what this document used to describe, and it is worth being precise about what moved.
-
-**Until 2026-08-29** the purchase carried four buy params, the store answered with a confirmation sheet, PassbookUIService drew it, AutoConfirmSheet dismissed it, and appstorectl replayed the `okButtonAction.buyParams` the rejection carried. Two to three attempts per install.
-
-**Now** the purchase carries `hasBeenAuthedForBuy=true` and `hasConfirmedPaymentSheet=true` — what Apple's own internal App Store CLI sends for a free or owned app — and the store does not ask. See [GATES.md](GATES.md) gate 3 for the measurements.
-
-The old path is still in the code and still reachable, because the new one does not cover everything:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as appstorectl
-    participant W as AutoConfirmSheet<br/>(in PassbookUIService)
-    participant A as appstored
-    participant S as store server
-
-    Note over C: --adam, or an account state the buy params do not cover
-    C->>C: create fresh /var/jb/tmp/.autoconfirm
-    C->>A: startPurchase: (ASDPurchase)
-    A->>S: buyProduct
-    S-->>A: dialog + replay params
-    A->>W: sheet is presented
-    W->>W: consume fresh flag
-    W->>A: dismiss
-    A-->>C: failure, carrying the replay params
-    C->>A: startPurchase: (replay)
-    A->>S: buyProduct + confirmedPaymentUUID
-    S-->>A: download IDs + SINF
-```
+The two pre-confirmed buy parameters avoid the confirmation sheet for free apps. `--adam` and
+unmapped account policies can still reach the older dismiss-and-replay path described in
+[GATES.md](GATES.md).
 
 Most of that is unremarkable. Four steps are not, and each has a detail the diagram cannot show.
 
@@ -194,7 +168,8 @@ flowchart TD
     style OK fill:#2EA043,color:#fff
 ```
 
-Gate 3 no longer fires on the default path: the store is told the sheet was already confirmed and does not raise one. The right-hand branch is what every install did until 2026-08-29 and is still what `--adam` gets.
+Gate 3 does not fire on the default path. `--adam` withholds the pre-confirmed parameters and can
+still reach the fallback.
 
 ### Gate 1, the password setting
 
@@ -325,7 +300,8 @@ The important part is what it does not do. It only ever dismisses, which is the 
 
 There is one honest limit to state. `--force-dismiss` creates `/var/jb/tmp/.autoconfirm` before purchasing. The tweak accepts the flag for at most five minutes and consumes it when the first matching sheet appears; the CLI also removes it when the purchase call ends normally. The hook matches on process and controller class, not on anything tying the sheet to our specific purchase. If another matching payment sheet appeared during that window, it could be dismissed instead. That is a cancelled sheet rather than an approved payment, but it is a real race and not something the design rules out.
 
-That race is now off the default path, which is the main practical argument for the buy-params approach over this one: `--force-dismiss` is off unless asked for, so no flag is created and the window never opens.
+The default path never creates this flag, so this race applies only when the fallback is explicitly
+armed.
 
 The dismissal selector also moved between releases, so it is probed at runtime rather than hardcoded:
 

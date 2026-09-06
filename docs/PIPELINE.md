@@ -147,21 +147,8 @@ salableAdamId=<id>&productType=C&price=0&pricingParameters=<STDQ|STDRDL>
 `pricingParameters` values present in this firmware: `STDQ` (standard purchase), `STDRDL` (standard
 redownload), `SWUPD` (update), `GAME` / `GAMEPRE` (Arcade), `STDQPRE` (pre-order).
 
-### The store's own string, for comparison
-
-The catalog will hand you the exact buy params it would use, via `AMSMediaTask` — see
-`cli/store/versions.m`. For `com.google.Authenticator`:
-
-```
-productType=C&price=0&salableAdamId=388497605&pricingParameters=STDQ&pg=default&appExtVrsId=890205999
-productType=C&price=0&salableAdamId=388497605&pricingParameters=SWUPD&pg=default&appExtVrsId=890205999
-```
-
-Two keys ours does not carry: `pg=default` (parental guidance) and `appExtVrsId` pinned to the
-current build. Neither has proved necessary on the appstored path.
-
-`ASDPurchaseHistoryApp.redownloadParams` is a third source — a store-issued string cached by
-appstored, reachable with no store request at all. Not used yet.
+`AMSMediaTask` also returns the store's own buy parameters. They add `pg=default` and pin the current
+`appExtVrsId`; neither is required on the verified appstored path.
 
 Key spellings, resolved from the `AMSBuyParamProperty*` constants appstored links:
 

@@ -1,36 +1,26 @@
 # Development notes
 
-appstorectl is a Theos aggregate project. Two components are built into the package:
+appstorectl is a Theos aggregate project. Three components are built into the package:
 
 - `cli/`: purchase, account, install, export, and logging commands
 - `cli/store/`: everything that talks to the store's own frameworks rather than to appstored
 - `decrypt/`: separately entitled helper for reading decrypted process memory
 
-and one is in the tree but **not** in `SUBPROJECTS`:
+AutoConfirmSheet remains in the tree but is not in `SUBPROJECTS`:
 
 - `tweak/`: AutoConfirmSheet injection for PassbookUIService. See below.
 
-`cli/store/` exists so that private-framework surface stays in one place instead of accreting in
-`appstorectl.m`:
+`cli/store/` keeps the AppleMediaServices interfaces out of `appstorectl.m`:
 
 | file | what |
 |---|---|
-| `AMSPrivate.h` | AppleMediaServices interfaces: the dialog objects, the purchase queue, the media task, the bag, the keybag. Every block signature is annotated with the type encoding it was read from |
-| `versions.{h,m}` | the catalog metadata lookup, and the version-list attempt that the store refuses |
-| `library.{h,m}` | what the active account owns, via `ASDPurchaseHistory` |
-| `buyparams.{h,m}` | pulling `okButtonAction.buyParams` out of a store refusal |
+| `AMSPrivate.h` | AppleMediaServices interfaces and verified block signatures |
+| `versions.{h,m}` | catalog and version lookup |
+| `library.{h,m}` | purchase history |
+| `buyparams.{h,m}` | dialog replay parameters |
 
-**Never guess a private block signature.** Declaring one wrong is a SIGBUS inside `objc_retain`,
-not an error you can catch, because ARC retains whatever happened to be in the argument register.
-Two of the four in `cli/store/` would have been wrong if guessed, and one was, and cost a crash.
-Read them out of the protocol method-type tables in the framework binary instead:
-
-```sh
-strings -a AppStoreDaemon | grep -E 'v[0-9]+@0:8.*@\?<'
-```
-
-The encoding inlines the block's own signature between the angle brackets. `ASDPrivate.h` has the
-longer version of this warning.
+Never guess a private block signature. Read it from the framework's protocol method-type table;
+`ASDPrivate.h` documents the failure mode and verified declarations.
 
 The decrypt helper must remain separate from the CLI. It needs `task_for_pid-allow`,
 `com.apple.private.cs.debugger`, and `no-sandbox`; the store client does not need those
@@ -51,7 +41,7 @@ to `/tmp` are killed on the tested palera1n devices.
 
 ## Purchase path
 
-Read [cli/ASDPrivate.h](cli/ASDPrivate.h) and [docs/PIPELINE.md](docs/PIPELINE.md) before changing
+Read [cli/ASDPrivate.h](../cli/ASDPrivate.h) and [PIPELINE.md](PIPELINE.md) before changing
 the purchase path. These constraints are easy to break silently:
 
 - `ASDPurchase.purchaseID` must be nonzero. A zero ID leaves the install job parked at phase 9.
@@ -69,7 +59,7 @@ the purchase path. These constraints are easy to break silently:
   `setActive:` followed by `saveAccount:verifyCredentials:NO`.
 
 Account behavior and the cache timing are documented in
-[docs/AUTH-INTERNALS.md](docs/AUTH-INTERNALS.md).
+[AUTH-INTERNALS.md](AUTH-INTERNALS.md).
 
 ## Biometric preflight
 
@@ -82,7 +72,7 @@ Two implementation details are required:
   Re-exec after dropping privileges because the parent has already initialized Objective-C, XPC,
   and CoreFoundation state.
 
-A valid enrolled identity is left untouched. See [docs/GATES.md](docs/GATES.md).
+A valid enrolled identity is left untouched. See [GATES.md](GATES.md).
 
 ## Export and decrypt
 
@@ -109,11 +99,8 @@ Important decrypt constraints:
 
 ## AutoConfirmSheet
 
-**Not built into the package since 2026-08-29.** The buy params stop the store raising a sheet, so
-`--force-dismiss` defaults to off and the tweak had nothing left to dismiss; `tweak` is off the
-`SUBPROJECTS` line and the package no longer depends on `ellekit`. The source is kept, and adding
-`tweak` back to `SUBPROJECTS` is the whole of restoring it — which is worth doing if `--adam` or an
-untested account state ever needs it. Everything below applies whenever it is built and armed.
+The package does not build this tweak. Free-app purchases normally avoid the confirmation sheet;
+add `tweak` to `SUBPROJECTS` only when testing the fallback path below.
 
 The tweak may dismiss the purchase-confirmation controller; it must never confirm or authorize a
 payment. Keep all three gates:
