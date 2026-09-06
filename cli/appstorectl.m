@@ -32,6 +32,7 @@
 #import "store/AMSPrivate.h"
 #import "store/buyparams.h"
 #import "store/library.h"
+#import "store/storefront.h"
 #import "store/versions.h"
 #import "ASDPrivate.h"
 #import "account.h"
@@ -118,7 +119,43 @@ static NSNumber *resolveAdamID(NSString *bundleID, NSString **outName, NSNumber 
              r[@"price"] ?: @"?", r[@"currency"] ?: @"", r[@"minimumOsVersion"] ?: @"?");
         return trackId;
     }
-    return nil;
+
+    // The endpoint above is public and follows the device locale, so an app that exists only in
+    // the account's storefront is invisible to it — mAadhaar (com.Uidai.mAadhaar) is in the Indian
+    // catalog and nowhere else, and a US-locale device cannot see it however the account is set.
+    //
+    // The catalog lookup is authenticated and follows the ACCOUNT's storefront, so it can. It costs
+    // a round trip and needs a signed-in account, which is why it is the fallback and not the
+    // first choice.
+    logLine(@"lookup: public endpoint had nothing for %@; trying the account's storefront", bundleID);
+    NSError *storeErr = nil;
+    NSDictionary *item = storeLookupForBundleID(bundleID, &storeErr);
+    if (!item) {
+        logLine(@"lookup: catalog lookup also failed: %@", storeErr.localizedDescription ?: @"?");
+        return nil;
+    }
+
+    NSNumber *itemID = item[@"id"];
+    if (![itemID isKindOfClass:NSNumber.class]) {
+        // amp-api returns the id as a string in some responses.
+        id raw = item[@"id"];
+        itemID = [raw isKindOfClass:NSString.class] ? @([raw longLongValue]) : nil;
+    }
+    if (!itemID) return nil;
+
+    NSDictionary *attrs = item[@"attributes"];
+    NSDictionary *ios   = attrs[@"platformAttributes"][@"ios"];
+    id offer  = [ios[@"offers"] isKindOfClass:NSArray.class] ? [ios[@"offers"] firstObject] : nil;
+    id price  = [offer isKindOfClass:NSDictionary.class] ? offer[@"price"] : nil;
+
+    if (outName)  *outName  = attrs[@"name"];
+    if (outPrice) *outPrice = [price respondsToSelector:@selector(doubleValue)]
+                            ? @([price doubleValue]) : nil;
+
+    note(@"[+] %@  ->  adamId %@   (%@, %@, minOS %@)  via the account's storefront",
+         bundleID, itemID, attrs[@"name"] ?: @"?",
+         price ?: @"?", ios[@"minimumOSVersion"] ?: @"?");
+    return itemID;
 }
 
 #pragma mark - Observers
@@ -270,6 +307,43 @@ static int cmdLibrary(NSString *filter) {
 
 /// Everything appstored holds about one owned app. Undocumented; this exists to answer whether
 /// preflightPackageURL and redownloadParams are usable without a store round trip.
+static int cmdStorefront(NSString *storefront) {
+    // No argument reads rather than writes. This is the value the setter acts on, which is not the
+    // one `accounts` prints — that comes from StoreServices and is a separate copy.
+    if (!storefront.length) {
+        NSArray<NSString *> *fronts = accountStorefronts();
+        if (!fronts.count) { warnf(@"no iTunes accounts"); return 1; }
+        for (NSString *line in fronts) note(@"  %@", line);
+        note(@"[=] this is ACAccount's value; `accounts` prints StoreServices', which can differ");
+        return 0;
+    }
+    // Only a shape check. Nothing on the device knows which fronts this account may buy from, and
+    // the save does not ask, so a wrong-but-plausible value is accepted here and refused by the
+    // store later. Catching a typo is worth it; pretending to validate is not.
+    //
+    // Both forms are allowed. asclient's help gives the bare front (143441) and that is what it
+    // writes, but the value already on an account reads back as "143441-1,29" — the front plus a
+    // platform suffix — so a digits-only check could not write an account's own value back.
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789-,"];
+    if (![allowed isSupersetOfSet:[NSCharacterSet characterSetWithCharactersInString:storefront]]
+        || !storefront.intValue) {
+        warnf(@"%@ does not look like a storefront id; expected 143444 or 143444-1,29", storefront);
+        return 64;
+    }
+
+    NSError *err = nil;
+    if (!setAccountStorefront(storefront, &err)) {
+        // Nothing to change is not a failure worth an error exit; every other case is.
+        if ([err.domain isEqualToString:@"appstorectl"] && err.code == 5) return 0;
+        warnf(@"could not set the storefront: %@", err.localizedDescription ?: @"unknown");
+        printErrorChain(err, 1);
+        return 1;
+    }
+    note(@"[+] storefront set. Saved locally and not validated until the next store call, which is");
+    note(@"    also when the system appends the platform suffix, e.g. 143444 becomes 143444-2,29.");
+    return 0;
+}
+
 static int cmdLibraryRaw(NSString *bundleID) {
     NSError *err = nil;
     NSArray<LibraryApp *> *apps = accountLibrary(@[bundleID], &err);
@@ -953,6 +1027,7 @@ static void usage(void) {
         "  appstorectl resolve   <bundle-id>\n"
         "  appstorectl versions  <bundle-id>\n"
         "  appstorectl library   [<bundle-id>]\n"
+        "  appstorectl storefront [<id>]\n"
         "  appstorectl uninstall <bundle-id>\n"
         "  appstorectl jobs\n"
         "  appstorectl version\n\n"
@@ -1092,6 +1167,7 @@ int main(int argc, char **argv) {
         // Account commands take an Apple ID, not a bundle ID, so they are dispatched before the
         // positional argument below is named `bundleID`.
         if ([cmd isEqualToString:@"accounts"]) return logEndSession(cmdAccounts());
+        if ([cmd isEqualToString:@"storefront"]) return logEndSession(cmdStorefront(pos.count ? pos[0] : nil));
         if ([cmd isEqualToString:@"library"])  return logEndSession(cmdLibrary(pos.count ? pos[0] : nil));
         if (pos.count < 1) { usage(); return logEndSession(64); }
         if ([cmd isEqualToString:@"login"])    return logEndSession(cmdLogin(pos[0], passwordFile, showPassword, allowBootstrap));

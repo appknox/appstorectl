@@ -13,7 +13,7 @@ APPSTORECTL_VERSION = 1.0.0
 # The service gate is a single entitlement: com.apple.itunesstored.private. Without it every call
 # into appstored returns ASDErrorDomain 505 "Not entitled for this service."
 appstorectl_FILES = appstorectl.m log.m export.m biometric.m account.m login.m logout.m authkit.m \
-                    store/versions.m store/buyparams.m store/library.m
+                    store/versions.m store/buyparams.m store/library.m store/storefront.m
 # -Werror=format, not blanket -Werror. note(), logLine() and warnf() are NS_FORMAT_FUNCTION, so
 # clang already checks their arguments, but a mismatch is only a warning by default and scrolls
 # past in a long build. Passing an int where %@ is expected sends a non-pointer through objc and
