@@ -42,7 +42,18 @@ static NSString *const kStoreDomain = @"com.apple.itunesstored";
 
 static void writeBiometricKeys(long long value) {
     ISBiometricStore *bio = [NSClassFromString(@"ISBiometricStore") sharedInstance];
-    [bio setBiometricState:value];   // writes BiometricState only
+    // The setter is synthesized from the readwrite property rather than declared, and class dumps
+    // of 27.2.1 no longer list it even though the object still answers it. Guard rather than
+    // assume: if a later build makes the property readonly, the CFPreferences write below is the
+    // path that must still work, because it is the one the daemons' own reads see.
+    if ([bio respondsToSelector:@selector(setBiometricState:)]) {
+        [bio setBiometricState:value];   // writes BiometricState only
+    } else {
+        CFPreferencesSetValue(CFSTR("BiometricState"),
+                              (__bridge CFNumberRef)@(value),
+                              (__bridge CFStringRef)kStoreDomain,
+                              kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    }
     CFPreferencesSetValue(CFSTR("BiometricStateEnabled"),
                           (__bridge CFNumberRef)@(value),
                           (__bridge CFStringRef)kStoreDomain,

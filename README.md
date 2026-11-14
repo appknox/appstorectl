@@ -13,7 +13,7 @@
 
 Installation uses the device's signed-in App Store account and Apple's own `appstored` purchase pipeline. Export rebuilds an IPA from the installed app and decrypts its Mach-O images by default.
 
-Verified on iOS 15.8.1 (19H380) and iOS 16.7.12 (20H364). Other iOS 15 and 16 releases have not been tested.
+Verified on iOS 15.8.1 (19H380), iOS 16.7.12 (20H364) and iOS 27.2.1 (24B156). Other releases have not been tested.
 
 ```console
 $ appstorectl install com.netflix.Speedtest
@@ -35,7 +35,7 @@ An install can run unattended once the account and device authorization state al
 - Rootless jailbreak on a device running a compatible iOS release
 - A signed-in App Store account
 - Theos for building
-- `com.autopear.installipa` and `zip` on the device
+- `zip` on the device (`apt install zip`)
 
 Tested configurations:
 
@@ -43,6 +43,7 @@ Tested configurations:
 |---|---|---|---|
 | iPhone9,3 | 15.8.1 | 19H380 | palera1n |
 | iPhone10,3 | 16.7.12 | 20H364 | palera1n |
+| iPhone12,1 | 27.2.1 | 24B156 | [Liter8 CFW](https://github.com/Xplo8E/liter8) |
 
 The project uses private Apple interfaces and may need updates for other OS versions.
 
@@ -153,6 +154,10 @@ See [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) for the complete flow and valid
 Free-app purchases normally avoid the confirmation sheet. Password, biometric and Ask to Buy
 policies may still require interaction; [docs/GATES.md](docs/GATES.md) covers those cases.
 AutoConfirmSheet remains in `tweak/` for research but is not included in the package.
+
+On iOS 27.2.1 the confirmation sheet re-raises for every replayed buy-parameter round, so an
+armed password policy makes the sheet re-appear once per retry rather than once per install.
+Clear the password gate first (`authpref free never`) for hands-off runs.
 
 ## Logs and privacy
 
