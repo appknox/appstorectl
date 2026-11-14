@@ -32,6 +32,14 @@ Two things commonly stated that are wrong:
 - **`com.apple.storekitservice` is hosted by appstored**, not itunesstored. Third-party StoreKit IAP
   lands there first.
 
+On iOS 27.2.1 (24B156) the daemon binaries moved out of `/usr/libexec` into their frameworks'
+`Support/` directories. The mach services are unchanged:
+
+| daemon | binary on 15/16 | binary on 27.2.1 |
+|---|---|---|
+| `appstored` | `/usr/libexec/appstored` | `/System/Library/PrivateFrameworks/AppStoreDaemon.framework/Support/appstored` |
+| `itunesstored` | `/usr/libexec/itunesstored` | `/System/Library/PrivateFrameworks/iTunesStore.framework/Support/itunesstored` |
+
 ## Client → appstored
 
 `ASDPurchaseManager` (or the `ASDPurchaseServiceProtocol` proxy directly) sends the purchase.

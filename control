@@ -6,4 +6,4 @@ Description: Install and export free App Store apps from the shell on jailbroken
 Maintainer: Vinay Kumar Rasala (Xplo8E)
 Author: Vinay Kumar Rasala (Xplo8E)
 Section: Utilities
-Depends: com.autopear.installipa, zip
+Depends: zip

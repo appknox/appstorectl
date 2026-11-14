@@ -222,3 +222,49 @@ work fine on a separate, server-side clock. Do not use it as a health signal.
   installs through `iTunesMetadata.plist`'s `softwareVersionBundleId`, not the path.
 - **`iTunesMetadata.plist` is written at placeholder-creation time**, so its presence proves nothing
   about the payload. A real install has the executable and `SC_Info/<App>.sinf`.
+
+## iOS 27.2.1 (24B156), measured on an iPhone12,1 under a liter8 CFW
+
+Everything above was measured on 15/16. The 27.2.1 port touched exactly one command. What the
+measurements showed:
+
+- **The purchase pipeline is unchanged in every client-visible way.** All `ASDPurchase` /
+  `ASDServiceBroker` / `ASDNotificationCenter` / `ASDJobManager` / `ASDPurchaseHistory` selectors,
+  the dialog-observer block type encodings, and the AMS classes used by `versions` and `storefront`
+  resolve byte-identical to the 15.8.1 declarations. `com.apple.itunesstored.private` still opens
+  the purchase service; the anisette in-process lookup still works with the same two entitlements.
+- **The confirmation sheet no longer stays suppressed when a password policy is armed.** On 15/16 a
+  replayed buy-params round completed the purchase after the first sheet. On 27.2.1 the store
+  re-raises a fresh sheet for every replayed round, so `install` against an account whose
+  `freeDownloadsPasswordSetting` is not `never` loops password prompts — one per attempt. Clear
+  gate 1 with `authpref free never` and the sheet never raises, as before.
+- **`uninstall` needed a rewrite because LaunchServices' uninstall API is a stub.** On 24B156,
+  every path in
+  `-[LSApplicationWorkspace uninstallApplication:withOptions:error:usingBlock:]` (CoreServices)
+  converges on `_LSMakeNSError` code -4 at LSApplicationWorkspace.m:3302 and `return NO`. There is
+  no success path in the function body. The old `ipainstaller -u` fallback is also unavailable on
+  modern bootstraps, and its package (`com.autopear.installipa`) is not carried by Procursus.
+  What works, and what the App Store app itself does: ask appstored. `ASDAppQuery` ->
+  `ASDApp` -> `+[ASDAppLibrary uninstallApp:requestUserConfirmation:withResultHandler:]`, the same
+  flow asclient's `remove` command runs. Both selectors are identical on 16.7.12 and 27.2.1, so
+  this is now the primary route on every release, with LaunchServices and `ipainstaller` kept as
+  fallbacks for older devices.
+- **`MobileInstallationUninstall` is gone on 27**; its replacement
+  `MobileInstallationUninstallAppWithIdentity` connects to installd, but installd drops the request
+  with `Exception caught during decoding of received selector
+  uninstallIdentity:withOptions:completion:` and the client reports NSCocoaErrorDomain 4097. Not
+  used.
+- **The MZBuy fulfilment wall behind `versions` persists on 27.2.1**: `p30-buy.itunes.apple.com`
+  answers HTTP 500 to the fulfilment round from this client, same as on 16.7.12. The sheet raises,
+  the replay is refused, and the current build still installs with `--evid`.
+- **`appstored` and `itunesstored` moved to their frameworks' `Support/` directories** (see
+  [PIPELINE.md](PIPELINE.md)). XPC service names are unchanged, which is why the client needed no
+  changes for it.
+- **Installed app containers now carry a `SerializedPlaceholder.ipa`** — a ~37 KB PK archive of
+  consumed streaming-zip fragments, not a persisted IPA. `export` ignores it and reconstructs from
+  the installed bundle, which is unchanged behaviour.
+- The class-dump-based port method was: extract the 24B156 arm64e dyld shared cache from the IPSW
+  (`ipsw extract --dyld --dyld-arch arm64e`), class-dump the five store frameworks, verify each
+  selector the CLI uses, then a 39-check runtime probe (`classes`, entitlement gate, locker,
+  anisette lookup) before touching the purchase path. The probe found the one moved interface in a
+  single pass; nothing else had drifted.

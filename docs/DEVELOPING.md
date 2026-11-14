@@ -39,6 +39,27 @@ Each subproject sets `TARGET` and `ARCHS` explicitly because Theos subprojects d
 from the aggregate Makefile. Rootless binaries must be installed below `/var/jb`; binaries copied
 to `/tmp` are killed on the tested palera1n devices.
 
+## Porting to a new iOS release
+
+The binaries build unchanged for new releases (the tool `dlopen`s its frameworks at runtime and
+resolves every class by name). What changes between releases is the private interface, so port in
+this order — measure first, then build:
+
+1. Extract the target build's arm64e dyld shared cache from the IPSW:
+   `ipsw extract --dyld --dyld-arch arm64e <ipsw>` (the `ipsw` toolkit).
+2. Class-dump the five store frameworks and diff every selector and block type encoding the CLI
+   uses against the declarations in `ASDPrivate.h`, `AMSPrivate.h`, `SSAuthPrivate.h` and
+   `AKPrivate.h`. On the 27.2.1 (24B156) port this found no interface drift at all.
+3. Run a read-only runtime probe on device before touching the purchase path: class inventory,
+   purchase-service acquisition (the entitlement gate), locker query, in-process anisette lookup.
+4. Only then run a real purchase of an owned free app, then export, then decrypt.
+
+Platform-specific notes from the 27.2.1 port live in [FINDINGS.md](FINDINGS.md). The notable ones:
+the daemon binaries moved into their frameworks' `Support/` directories, LaunchServices' uninstall
+API became a stub (uninstall now goes through appstored, see `cmdUninstall` in
+[cli/appstorectl.m](../cli/appstorectl.m)), and an armed password policy re-raises the payment
+sheet on every replayed round rather than once per install.
+
 ## Purchase path
 
 Read [cli/ASDPrivate.h](../cli/ASDPrivate.h) and [PIPELINE.md](PIPELINE.md) before changing

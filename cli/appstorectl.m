@@ -1088,6 +1088,169 @@ static int cmdInstall(NSString *bundleID, NSNumber *adamID, NSNumber *evid, BOOL
     return 5;
 }
 
+#pragma mark - Uninstall
+
+// LSApplicationWorkspace moved between releases. On iOS 15/16 the class ships in MobileCoreServices;
+// on iOS 27 it is in CoreServices. Both are loaded lazily by name, so dlopen the candidates and let
+// NSClassFromString find whichever is present. A failed dlopen here is not an error by itself —
+// another framework may already have pulled the class in.
+static void loadLaunchServicesForUninstall(void) {
+    dlopen("/System/Library/PrivateFrameworks/MobileCoreServices.framework/MobileCoreServices",
+           RTLD_LAZY);
+    dlopen("/System/Library/PrivateFrameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
+}
+
+// Declared rather than imported; resolved by name after the dlopen above. The selector list is
+// read out of the framework binary, verified present on 15.8.1, 16.7.12 and 27.2.1.
+@interface LSApplicationWorkspace : NSObject
++ (id)defaultWorkspace;
+- (BOOL)uninstallApplication:(NSString *)bundleID withOptions:(NSDictionary *)options;
+@end
+
+// Tier 2. Removes an installed app through LaunchServices, the same path Settings -> General ->
+// iPhone Storage takes. Works as root on iOS 15/16. On iOS 27 this API is a stub: every path in
+// -[LSApplicationWorkspace uninstallApplication:withOptions:error:usingBlock:] (CoreServices,
+// 24B156) converges on _LSMakeNSError(-4) + return NO — there is no success path at all — so this
+// tier returns NO there and the caller falls through.
+static BOOL uninstallViaWorkspace(NSString *bundleID) {
+    loadLaunchServicesForUninstall();
+    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
+    if (!workspaceClass) {
+        logLine(@"uninstall: LSApplicationWorkspace unavailable");
+        return NO;
+    }
+    id workspace = [(id)workspaceClass defaultWorkspace];
+    if (!workspace) { logLine(@"uninstall: defaultWorkspace nil"); return NO; }
+    if (![workspace respondsToSelector:@selector(uninstallApplication:withOptions:)]) {
+        logLine(@"uninstall: uninstallApplication:withOptions: not implemented");
+        return NO;
+    }
+
+    // withOptions nil is the plain uninstall, same as passing nothing to ipainstaller -u.
+    BOOL removed = NO;
+    @try {
+        removed = [(LSApplicationWorkspace *)workspace uninstallApplication:bundleID
+                                                               withOptions:nil];
+    } @catch (NSException *e) {
+        logLine(@"uninstall: threw %@", e.reason);
+        return NO;
+    }
+    logLine(@"uninstall: LSApplicationWorkspace returned %d for %@", removed, bundleID);
+    return removed;
+}
+
+// Tier 1: appstored's own App Library service, the path the App Store app's Remove button takes.
+//
+//   1. ASDAppQuery -> the ASDApp object for the bundle ID
+//   2. +[ASDAppLibrary uninstallApp:<app> requestUserConfirmation:NO withResultHandler:]
+//
+// Chosen over the alternatives after measuring them on 27.2.1: LaunchServices is stubbed (above);
+// MobileInstallationUninstallAppWithIdentity exists but its installd XPC request is dropped with
+// "Exception caught during decoding of received selector uninstallIdentity:withOptions:completion:"
+// and the client sees NSCocoaErrorDomain 4097. This route rides the same appstored connection the
+// purchase path already holds, needs no entitlement the CLI does not carry, and its two selectors
+// are identical on 16.7.12 and 27.2.1. The flow is what Apple's own asclient `remove` command
+// runs (asclient-re/decomp/LibraryCommand__runWithArguments_andOptions_.c: NSPredicate
+// `bundleID == %@` -> ASDAppQuery any -> uninstallApp).
+//
+// The query constructor differs by release: queryForBundleIDs: on 27.2.1, queryWithPredicate: on
+// 16.7.12 — hence the two probes. Reply block arities are undocumented, so they are declared with
+// void* slots and slot 0 is screened with the pointer-alignment check used in cmdJobs; the outcome
+// is confirmed by re-reading the filesystem, never by trusting the reply.
+//
+// Returns YES only when the app's container actually disappeared.
+
+// The two appstored types the flow needs. Declared rather than imported; resolved by name after
+// AppStoreDaemon is dlopened. Method lists read out of the framework binaries; both selectors
+// verified identical on 16.7.12 and 27.2.1.
+@interface ASDAppQuery : NSObject
++ (id)queryForBundleIDs:(NSArray *)ids;
++ (id)queryWithPredicate:(NSPredicate *)predicate;
+- (void)executeQueryWithResultHandler:(void (^)(void *a0, void *a1, void *a2))handler;
+@end
+
+@interface ASDAppLibrary : NSObject
++ (void)uninstallApp:(id)app requestUserConfirmation:(BOOL)confirm
+          withResultHandler:(void (^)(void *a0, void *a1))handler;
+@end
+
+static BOOL uninstallViaAppStoreDaemon(NSString *bundleID) {
+    Class queryClass = NSClassFromString(@"ASDAppQuery");
+    Class libClass   = NSClassFromString(@"ASDAppLibrary");
+    if (!queryClass || !libClass) {
+        logLine(@"uninstall: appstored classes unavailable (query=%d lib=%d)",
+                queryClass != nil, libClass != nil);
+        return NO;
+    }
+
+    id query = nil;
+    if ([queryClass respondsToSelector:@selector(queryForBundleIDs:)]) {
+        query = [(id)queryClass queryForBundleIDs:@[bundleID]];
+        logLine(@"uninstall: query via queryForBundleIDs:");
+    } else if ([queryClass respondsToSelector:@selector(queryWithPredicate:)]) {
+        NSPredicate *predicate =
+            [NSPredicate predicateWithFormat:@"bundleID == %@", bundleID];
+        query = [(id)queryClass queryWithPredicate:predicate];
+        logLine(@"uninstall: query via queryWithPredicate:");
+    }
+    if (!query) {
+        logLine(@"uninstall: no usable ASDAppQuery constructor");
+        return NO;
+    }
+
+    // The reply's delivery thread is not documented: the purchase-history query resolves off this
+    // thread (a semaphore is correct there), while the AMS purchase queue resolves ON this
+    // thread's runloop and a semaphore deadlocks (see store/versions.m). Spinning the runloop
+    // serves both modes, which matters because this tier is the first thing older releases run.
+    __block BOOL done = NO;
+    __block id app = nil;
+    [query executeQueryWithResultHandler:^(void *a0, void *a1, void *a2) {
+        id results = (a0 && !((uintptr_t)a0 & 7)) ? (__bridge id)a0 : nil;
+        if ([results isKindOfClass:NSArray.class]) {
+            for (id candidate in results) {
+                if ([candidate respondsToSelector:@selector(bundleID)] &&
+                    [[candidate bundleID] isKindOfClass:NSString.class] &&
+                    [[candidate bundleID] isEqualToString:bundleID]) {
+                    app = candidate;
+                    break;
+                }
+            }
+        } else if ([results isKindOfClass:NSDictionary.class]) {
+            id found = results[bundleID];
+            if ([found respondsToSelector:@selector(bundleID)]) app = found;
+        }
+        done = YES;
+    }];
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:20.0];
+    while (!done && [deadline timeIntervalSinceNow] > 0)
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+    if (!done) {
+        logLine(@"uninstall: library query timed out");
+        return NO;
+    }
+    logLine(@"uninstall: library query replied, app %@", app ? @"found" : @"absent");
+    if (!app) return NO;
+
+    // requestUserConfirmation NO: the user already typed the command, and a daemon-side alert
+    // would hang a hands-off run. Completion is judged below by the container actually going
+    // away, which is the same ground truth the install wait uses. The handler is logged, not
+    // acted on: a silent daemon refusal should still leave a trace in the 0600 log.
+    [(id)libClass uninstallApp:app requestUserConfirmation:NO
+             withResultHandler:^(void *a0, void *a1) {
+        logLine(@"uninstall: reply slot0=%p slot1=%p", a0, a1);
+    }];
+    logLine(@"uninstall: uninstallApp sent for %@", bundleID);
+
+    NSDate *gone = [NSDate dateWithTimeIntervalSinceNow:20.0];
+    while ([gone timeIntervalSinceNow] > 0) {
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
+        if (!installedContainerPath(bundleID)) return YES;
+    }
+    logLine(@"uninstall: container still present after 20s");
+    return NO;
+}
+
 static int cmdUninstall(NSString *bundleID) {
     NSString *app = installedBundlePath(bundleID);
     // 66 (EX_NOINPUT), matching export, rather than 0. Both are asked to act on an installed app
@@ -1095,15 +1258,36 @@ static int cmdUninstall(NSString *bundleID) {
     // treats 0 as "it is gone now" would otherwise never notice it had the wrong bundle ID.
     if (!app) { warnf(@"%@ is not installed", bundleID); return 66; }
 
-    // MobileInstallation is the right API, but ipainstaller ships with the bootstrap and handles
-    // LaunchServices deregistration correctly, so spawn it rather than reimplement it.
-    // posix_spawn rather than system() so the bundle ID never goes through a shell.
+    // appstored first: proven on 27.2.1, selectors identical on 16.7.12, untested on 15.8.1 —
+    // if anything differs there the failure lands in the log and the fallbacks below take over.
+    if (uninstallViaAppStoreDaemon(bundleID)) return 0;
+
+    // LaunchServices, works on iOS 15/16, stubbed on 27.
+    if (uninstallViaWorkspace(bundleID)) {
+        // LaunchServices deregistration is asynchronous; the container lingers for a moment after
+        // the YES. Poll briefly so a caller that uninstalls and immediately reinstalls the same
+        // bundle does not race installd over the same container path.
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:10.0];
+        while (installedBundlePath(bundleID) && [deadline timeIntervalSinceNow] > 0)
+            [[NSRunLoop currentRunLoop] runUntilDate:
+                [NSDate dateWithTimeIntervalSinceNow:0.25]];
+        if (!installedBundlePath(bundleID)) return 0;
+        warnf(@"%@ deregistered, but its container is still on disk; a reinstall will reuse it",
+              bundleID);
+        return 0;
+    }
+
+    // Last resort for bootstraps that ship ipainstaller (com.autopear.installipa). Spawn rather
+    // than system() so the bundle ID never goes through a shell.
     const char *tool = "/var/jb/usr/bin/ipainstaller";
     char *const args[] = { (char *)tool, (char *)"-u", (char *)bundleID.UTF8String, NULL };
     logLine(@"exec %s -u %@", tool, bundleID);
     pid_t pid = 0;
-    if (posix_spawn(&pid, tool, NULL, NULL, args, NULL) != 0) {
-        warnf(@"could not run ipainstaller: %s", strerror(errno));
+    int spawnErr = posix_spawn(&pid, tool, NULL, NULL, args, NULL);
+    if (spawnErr != 0) {
+        // posix_spawn reports its reason as its return value, not errno.
+        warnf(@"uninstall failed: every route refused (%@). ipainstaller is not installed: %s",
+              bundleID, strerror(spawnErr));
         return 1;
     }
     int status = 0;
